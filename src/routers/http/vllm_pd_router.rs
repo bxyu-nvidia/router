@@ -1157,6 +1157,10 @@ impl VllmPDRouter {
     /// This function handles fine-grained load tracking: the prefill worker's load is only
     /// incremented during the prefill phase, and the decode worker's load is only incremented
     /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// 
+    /// In practice, we increment the decode worker's load as soon as we enter this function to avoid
+    /// heavy imbalances under high concurrency due to the same decode worker being selected while
+    /// waiting for the prefill request to finish.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1179,6 +1183,11 @@ impl VllmPDRouter {
         // (e.g. client disconnect dropping the handler future), which the
         // previous manual decrements leaked.
         let prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
+
+        // Set the decode_guard here too so that one engine to avoid races between
+        // decode worker selection and decode engine load calculatino during
+        // cache-aware routing.
+        let decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1351,7 +1360,6 @@ impl VllmPDRouter {
         // Prefill phase complete: release prefill load, track decode load.
         // The decode guard releases on every exit path, including cancellation.
         prefill_guard.release();
-        let decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
