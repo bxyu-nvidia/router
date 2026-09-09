@@ -2426,6 +2426,7 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::LoadBalancingPolicy;
     use axum::extract::Json;
     use serde_json::json;
 
@@ -2847,9 +2848,17 @@ mod tests {
         });
 
         // Wait until the request reached the prefill worker and its load is
-        // counted, then cancel the whole request task.
+        // counted. The decode worker must already be reserved so that another
+        // concurrent request observes the pending decode work during selection.
         entered.notified().await;
         wait_for_load(&prefill_worker, 1).await;
+        assert_eq!(
+            decode_worker.load(),
+            1,
+            "decode load must be reserved while prefill is still pending"
+        );
+
+        // Cancelling the whole request must release both reservations.
         handle.abort();
         let _ = handle.await;
 
@@ -2859,6 +2868,100 @@ mod tests {
             "cancelling a P/D request must release its prefill load"
         );
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    /// A decode reservation made by one request while its prefill is pending
+    /// must be visible to policy selection for a concurrent request.
+    #[tokio::test]
+    async fn test_concurrent_decode_selection_observes_prefill_reservation() {
+        let router = Arc::new(test_vllm_pd_router());
+        let (prefill_url, _entered, _release, _server) = start_pending_mock_server().await;
+
+        let prefill_worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://127.0.0.1:1".to_string(),
+                WorkerType::Decode,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://127.0.0.1:2".to_string(),
+                WorkerType::Decode,
+            )),
+        ];
+
+        // Force cache-miss routing so selection is determined by worker load.
+        let policy = crate::policies::CacheAwarePolicy::with_config(
+            crate::policies::CacheAwareConfig {
+                cache_threshold: 1.0,
+                eviction_interval_secs: 0,
+                ..Default::default()
+            },
+        );
+        policy.init_workers(&decode_workers);
+
+        let first_idx = policy
+            .select_worker(&decode_workers, Some("first request"))
+            .expect("first decode worker should be selected");
+        assert_eq!(
+            first_idx, 0,
+            "equal-load selection should choose the first worker"
+        );
+
+        let first_router = router.clone();
+        let first_prefill = prefill_worker.clone();
+        let first_decode = decode_workers[first_idx].clone();
+        let first = tokio::spawn(async move {
+            let _ = first_router
+                .process_vllm_two_stage_request(
+                    json!({"model": "test", "messages": []}),
+                    first_prefill,
+                    first_decode,
+                    "/v1/chat/completions",
+                    None,
+                )
+                .await;
+        });
+
+        // The first request is blocked in prefill, but its decode reservation
+        // must already steer the next selection to the idle worker.
+        wait_for_load(&decode_workers[first_idx], 1).await;
+        let second_idx = policy
+            .select_worker(&decode_workers, Some("second unrelated request"))
+            .expect("second decode worker should be selected");
+        assert_eq!(second_idx, 1);
+
+        let second_router = router.clone();
+        let second_prefill = prefill_worker.clone();
+        let second_decode = decode_workers[second_idx].clone();
+        let second = tokio::spawn(async move {
+            let _ = second_router
+                .process_vllm_two_stage_request(
+                    json!({"model": "test", "messages": []}),
+                    second_prefill,
+                    second_decode,
+                    "/v1/chat/completions",
+                    None,
+                )
+                .await;
+        });
+
+        wait_for_load(&decode_workers[second_idx], 1).await;
+        assert_eq!(decode_workers[0].load(), 1);
+        assert_eq!(decode_workers[1].load(), 1);
+
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+
+        assert_eq!(prefill_worker.load(), 0);
+        assert_eq!(decode_workers[0].load(), 0);
+        assert_eq!(decode_workers[1].load(), 0);
     }
 
     /// Cancelling a two-stage request while the decode response is pending
