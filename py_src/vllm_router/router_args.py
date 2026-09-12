@@ -32,6 +32,16 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
+    prefill_cache_threshold: Optional[float] = None
+    prefill_balance_abs_threshold: Optional[int] = None
+    prefill_balance_rel_threshold: Optional[float] = None
+    prefill_eviction_interval_secs: Optional[int] = None
+    prefill_max_tree_size: Optional[int] = None
+    decode_cache_threshold: Optional[float] = None
+    decode_balance_abs_threshold: Optional[int] = None
+    decode_balance_rel_threshold: Optional[float] = None
+    decode_eviction_interval_secs: Optional[int] = None
+    decode_max_tree_size: Optional[int] = None
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     intra_node_data_parallel_size: int = (
         1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
@@ -238,6 +248,39 @@ class RouterArgs:
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
         )
+        for stage in ("prefill", "decode"):
+            parser.add_argument(
+                f"--{prefix}{stage}-cache-threshold",
+                type=float,
+                default=None,
+                help=f"Cache threshold for {stage} nodes; defaults to --{prefix}cache-threshold",
+            )
+            parser.add_argument(
+                f"--{prefix}{stage}-balance-abs-threshold",
+                type=int,
+                default=None,
+                help=f"Absolute load-balancing threshold for {stage} nodes; defaults to --{prefix}balance-abs-threshold",
+            )
+            parser.add_argument(
+                f"--{prefix}{stage}-balance-rel-threshold",
+                type=float,
+                default=None,
+                help=f"Relative load-balancing threshold for {stage} nodes; defaults to --{prefix}balance-rel-threshold",
+            )
+            parser.add_argument(
+                f"--{prefix}{stage}-eviction-interval-secs",
+                f"--{prefix}{stage}-eviction-interval",
+                dest=f"{prefix}{stage}_eviction_interval_secs",
+                type=int,
+                default=None,
+                help=f"Cache eviction interval for {stage} nodes; defaults to --{prefix}eviction-interval-secs",
+            )
+            parser.add_argument(
+                f"--{prefix}{stage}-max-tree-size",
+                type=int,
+                default=None,
+                help=f"Maximum cache tree size for {stage} nodes; defaults to --{prefix}max-tree-size",
+            )
         parser.add_argument(
             f"--{prefix}max-payload-size",
             type=int,

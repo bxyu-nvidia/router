@@ -28,6 +28,13 @@ pub enum PolicyType {
     ConsistentHash,
 }
 
+#[derive(Copy, Clone)]
+enum CacheStage {
+    Main,
+    Prefill,
+    Decode,
+}
+
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
@@ -42,6 +49,16 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    prefill_cache_threshold: Option<f32>,
+    prefill_balance_abs_threshold: Option<usize>,
+    prefill_balance_rel_threshold: Option<f32>,
+    prefill_eviction_interval_secs: Option<u64>,
+    prefill_max_tree_size: Option<usize>,
+    decode_cache_threshold: Option<f32>,
+    decode_balance_abs_threshold: Option<usize>,
+    decode_balance_rel_threshold: Option<f32>,
+    decode_eviction_interval_secs: Option<u64>,
+    decode_max_tree_size: Option<usize>,
     max_payload_size: usize,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
@@ -107,16 +124,52 @@ impl Router {
         };
 
         // Convert policy helper function
-        let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
+        let convert_policy = |policy: &PolicyType, stage: CacheStage| -> ConfigPolicyConfig {
+            let (
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            ) = match stage {
+                CacheStage::Prefill => (
+                    self.prefill_cache_threshold.unwrap_or(self.cache_threshold),
+                    self.prefill_balance_abs_threshold
+                        .unwrap_or(self.balance_abs_threshold),
+                    self.prefill_balance_rel_threshold
+                        .unwrap_or(self.balance_rel_threshold),
+                    self.prefill_eviction_interval_secs
+                        .unwrap_or(self.eviction_interval_secs),
+                    self.prefill_max_tree_size.unwrap_or(self.max_tree_size),
+                ),
+                CacheStage::Decode => (
+                    self.decode_cache_threshold.unwrap_or(self.cache_threshold),
+                    self.decode_balance_abs_threshold
+                        .unwrap_or(self.balance_abs_threshold),
+                    self.decode_balance_rel_threshold
+                        .unwrap_or(self.balance_rel_threshold),
+                    self.decode_eviction_interval_secs
+                        .unwrap_or(self.eviction_interval_secs),
+                    self.decode_max_tree_size.unwrap_or(self.max_tree_size),
+                ),
+                CacheStage::Main => (
+                    self.cache_threshold,
+                    self.balance_abs_threshold,
+                    self.balance_rel_threshold,
+                    self.eviction_interval_secs,
+                    self.max_tree_size,
+                ),
+            };
+
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                    eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: self.max_tree_size,
+                    cache_threshold,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    eviction_interval_secs,
+                    max_tree_size,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
@@ -126,6 +179,17 @@ impl Router {
                 },
             }
         };
+
+        let has_prefill_cache_overrides = self.prefill_cache_threshold.is_some()
+            || self.prefill_balance_abs_threshold.is_some()
+            || self.prefill_balance_rel_threshold.is_some()
+            || self.prefill_eviction_interval_secs.is_some()
+            || self.prefill_max_tree_size.is_some();
+        let has_decode_cache_overrides = self.decode_cache_threshold.is_some()
+            || self.decode_balance_abs_threshold.is_some()
+            || self.decode_balance_rel_threshold.is_some()
+            || self.decode_eviction_interval_secs.is_some()
+            || self.decode_max_tree_size.is_some();
 
         // Determine routing mode
         let mode = if self.enable_igw {
@@ -137,8 +201,16 @@ impl Router {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .or(has_prefill_cache_overrides.then_some(&self.policy))
+                    .map(|policy| convert_policy(policy, CacheStage::Prefill)),
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .or(has_decode_cache_overrides.then_some(&self.policy))
+                    .map(|policy| convert_policy(policy, CacheStage::Decode)),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -148,7 +220,7 @@ impl Router {
         };
 
         // Convert main policy
-        let policy = convert_policy(&self.policy);
+        let policy = convert_policy(&self.policy, CacheStage::Main);
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -256,6 +328,16 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        prefill_cache_threshold = None,
+        prefill_balance_abs_threshold = None,
+        prefill_balance_rel_threshold = None,
+        prefill_eviction_interval_secs = None,
+        prefill_max_tree_size = None,
+        decode_cache_threshold = None,
+        decode_balance_abs_threshold = None,
+        decode_balance_rel_threshold = None,
+        decode_eviction_interval_secs = None,
+        decode_max_tree_size = None,
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,
@@ -324,6 +406,16 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        prefill_cache_threshold: Option<f32>,
+        prefill_balance_abs_threshold: Option<usize>,
+        prefill_balance_rel_threshold: Option<f32>,
+        prefill_eviction_interval_secs: Option<u64>,
+        prefill_max_tree_size: Option<usize>,
+        decode_cache_threshold: Option<f32>,
+        decode_balance_abs_threshold: Option<usize>,
+        decode_balance_rel_threshold: Option<f32>,
+        decode_eviction_interval_secs: Option<u64>,
+        decode_max_tree_size: Option<usize>,
         max_payload_size: usize,
         intra_node_data_parallel_size: usize,
         api_key: Option<String>,
@@ -385,6 +477,16 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            prefill_cache_threshold,
+            prefill_balance_abs_threshold,
+            prefill_balance_rel_threshold,
+            prefill_eviction_interval_secs,
+            prefill_max_tree_size,
+            decode_cache_threshold,
+            decode_balance_abs_threshold,
+            decode_balance_rel_threshold,
+            decode_eviction_interval_secs,
+            decode_max_tree_size,
             max_payload_size,
             intra_node_data_parallel_size,
             api_key,

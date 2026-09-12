@@ -31,6 +31,8 @@ class TestRouterArgs:
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
+        assert args.prefill_balance_abs_threshold is None
+        assert args.decode_balance_abs_threshold is None
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -61,6 +63,43 @@ class TestRouterArgs:
         # Test None
         result = RouterArgs._parse_selector(None)
         assert result == {}
+
+    def test_parse_independent_cache_aware_pd_settings(self):
+        args = parse_router_args(
+            [
+                "--prefill-cache-threshold",
+                "0.7",
+                "--prefill-balance-abs-threshold",
+                "8",
+                "--prefill-balance-rel-threshold",
+                "1.2",
+                "--prefill-eviction-interval-secs",
+                "60",
+                "--prefill-max-tree-size",
+                "7000",
+                "--decode-cache-threshold",
+                "0.3",
+                "--decode-balance-abs-threshold",
+                "4",
+                "--decode-balance-rel-threshold",
+                "1.1",
+                "--decode-eviction-interval",
+                "120",
+                "--decode-max-tree-size",
+                "3000",
+            ]
+        )
+
+        assert args.prefill_cache_threshold == 0.7
+        assert args.prefill_balance_abs_threshold == 8
+        assert args.prefill_balance_rel_threshold == 1.2
+        assert args.prefill_eviction_interval_secs == 60
+        assert args.prefill_max_tree_size == 7000
+        assert args.decode_cache_threshold == 0.3
+        assert args.decode_balance_abs_threshold == 4
+        assert args.decode_balance_rel_threshold == 1.1
+        assert args.decode_eviction_interval_secs == 120
+        assert args.decode_max_tree_size == 3000
 
     def test_parse_selector_invalid(self):
         """Test parsing invalid selector arguments."""
