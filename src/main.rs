@@ -68,6 +68,12 @@ impl std::fmt::Display for Backend {
     }
 }
 
+#[derive(Copy, Clone)]
+enum PdStage {
+    Prefill,
+    Decode,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "vllm-router")]
 #[command(version)]
@@ -158,6 +164,46 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// Cache threshold for prefill nodes; defaults to --cache-threshold
+    #[arg(long)]
+    prefill_cache_threshold: Option<f32>,
+
+    /// Absolute load-balancing threshold for prefill nodes; defaults to --balance-abs-threshold
+    #[arg(long)]
+    prefill_balance_abs_threshold: Option<usize>,
+
+    /// Relative load-balancing threshold for prefill nodes; defaults to --balance-rel-threshold
+    #[arg(long)]
+    prefill_balance_rel_threshold: Option<f32>,
+
+    /// Cache eviction interval for prefill nodes; defaults to --eviction-interval
+    #[arg(long)]
+    prefill_eviction_interval: Option<u64>,
+
+    /// Maximum cache tree size for prefill nodes; defaults to --max-tree-size
+    #[arg(long)]
+    prefill_max_tree_size: Option<usize>,
+
+    /// Cache threshold for decode nodes; defaults to --cache-threshold
+    #[arg(long)]
+    decode_cache_threshold: Option<f32>,
+
+    /// Absolute load-balancing threshold for decode nodes; defaults to --balance-abs-threshold
+    #[arg(long)]
+    decode_balance_abs_threshold: Option<usize>,
+
+    /// Relative load-balancing threshold for decode nodes; defaults to --balance-rel-threshold
+    #[arg(long)]
+    decode_balance_rel_threshold: Option<f32>,
+
+    /// Cache eviction interval for decode nodes; defaults to --eviction-interval
+    #[arg(long)]
+    decode_eviction_interval: Option<u64>,
+
+    /// Maximum cache tree size for decode nodes; defaults to --max-tree-size
+    #[arg(long)]
+    decode_max_tree_size: Option<usize>,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -356,15 +402,87 @@ impl CliArgs {
 
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
+        self.parse_policy_for_stage(policy_str, None)
+    }
+
+    fn has_cache_overrides_for_stage(&self, stage: PdStage) -> bool {
+        match stage {
+            PdStage::Prefill => {
+                self.prefill_cache_threshold.is_some()
+                    || self.prefill_balance_abs_threshold.is_some()
+                    || self.prefill_balance_rel_threshold.is_some()
+                    || self.prefill_eviction_interval.is_some()
+                    || self.prefill_max_tree_size.is_some()
+            }
+            PdStage::Decode => {
+                self.decode_cache_threshold.is_some()
+                    || self.decode_balance_abs_threshold.is_some()
+                    || self.decode_balance_rel_threshold.is_some()
+                    || self.decode_eviction_interval.is_some()
+                    || self.decode_max_tree_size.is_some()
+            }
+        }
+    }
+
+    fn parse_pd_policy(
+        &self,
+        configured_policy: Option<&String>,
+        stage: PdStage,
+    ) -> Option<PolicyConfig> {
+        configured_policy
+            .map(|policy| self.parse_policy_for_stage(policy, Some(stage)))
+            .or_else(|| {
+                self.has_cache_overrides_for_stage(stage)
+                    .then(|| self.parse_policy_for_stage(&self.policy, Some(stage)))
+            })
+    }
+
+    fn parse_policy_for_stage(&self, policy_str: &str, stage: Option<PdStage>) -> PolicyConfig {
+        let (
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+        ) = match stage {
+            Some(PdStage::Prefill) => (
+                self.prefill_cache_threshold.unwrap_or(self.cache_threshold),
+                self.prefill_balance_abs_threshold
+                    .unwrap_or(self.balance_abs_threshold),
+                self.prefill_balance_rel_threshold
+                    .unwrap_or(self.balance_rel_threshold),
+                self.prefill_eviction_interval
+                    .unwrap_or(self.eviction_interval),
+                self.prefill_max_tree_size.unwrap_or(self.max_tree_size),
+            ),
+            Some(PdStage::Decode) => (
+                self.decode_cache_threshold.unwrap_or(self.cache_threshold),
+                self.decode_balance_abs_threshold
+                    .unwrap_or(self.balance_abs_threshold),
+                self.decode_balance_rel_threshold
+                    .unwrap_or(self.balance_rel_threshold),
+                self.decode_eviction_interval
+                    .unwrap_or(self.eviction_interval),
+                self.decode_max_tree_size.unwrap_or(self.max_tree_size),
+            ),
+            None => (
+                self.cache_threshold,
+                self.balance_abs_threshold,
+                self.balance_rel_threshold,
+                self.eviction_interval,
+                self.max_tree_size,
+            ),
+        };
+
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
-                cache_threshold: self.cache_threshold,
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                eviction_interval_secs: self.eviction_interval,
-                max_tree_size: self.max_tree_size,
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -443,8 +561,9 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self
+                    .parse_pd_policy(self.prefill_policy.as_ref(), PdStage::Prefill),
+                decode_policy: self.parse_pd_policy(self.decode_policy.as_ref(), PdStage::Decode),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -614,6 +733,120 @@ impl CliArgs {
             } else {
                 None
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_cache_aware(policy: PolicyConfig, expected: (f32, usize, f32, u64, usize)) {
+        match policy {
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                assert_eq!(
+                    (
+                        cache_threshold,
+                        balance_abs_threshold,
+                        balance_rel_threshold,
+                        eviction_interval_secs,
+                        max_tree_size,
+                    ),
+                    expected
+                );
+            }
+            policy => panic!("expected cache-aware policy, got {policy:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_aware_pd_stages_accept_independent_cli_settings() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--cache-threshold",
+            "0.4",
+            "--balance-abs-threshold",
+            "40",
+            "--balance-rel-threshold",
+            "1.4",
+            "--eviction-interval",
+            "400",
+            "--max-tree-size",
+            "4000",
+            "--prefill-cache-threshold",
+            "0.7",
+            "--prefill-balance-abs-threshold",
+            "70",
+            "--prefill-balance-rel-threshold",
+            "1.7",
+            "--prefill-eviction-interval",
+            "700",
+            "--prefill-max-tree-size",
+            "7000",
+            "--decode-cache-threshold",
+            "0.2",
+            "--decode-balance-abs-threshold",
+            "20",
+            "--decode-balance-rel-threshold",
+            "1.2",
+            "--decode-eviction-interval",
+            "200",
+            "--decode-max-tree-size",
+            "2000",
+        ])
+        .unwrap();
+
+        assert_cache_aware(
+            args.parse_policy_for_stage("cache_aware", Some(PdStage::Prefill)),
+            (0.7, 70, 1.7, 700, 7000),
+        );
+        assert_cache_aware(
+            args.parse_policy_for_stage("cache_aware", Some(PdStage::Decode)),
+            (0.2, 20, 1.2, 200, 2000),
+        );
+        assert_cache_aware(args.parse_policy("cache_aware"), (0.4, 40, 1.4, 400, 4000));
+    }
+
+    #[test]
+    fn cache_aware_pd_stage_settings_fall_back_to_global_values() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--vllm-discovery-address",
+            "127.0.0.1:30001",
+            "--cache-threshold",
+            "0.6",
+            "--decode-cache-threshold",
+            "0.8",
+        ])
+        .unwrap();
+
+        assert_cache_aware(
+            args.parse_policy_for_stage("cache_aware", Some(PdStage::Prefill)),
+            (0.6, 64, 1.5, 120, 67108864),
+        );
+        assert_cache_aware(
+            args.parse_policy_for_stage("cache_aware", Some(PdStage::Decode)),
+            (0.8, 64, 1.5, 120, 67108864),
+        );
+
+        let config = args.to_router_config(vec![]).unwrap();
+        match config.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy,
+                decode_policy: Some(decode_policy),
+                ..
+            } => {
+                assert!(prefill_policy.is_none());
+                assert_cache_aware(decode_policy, (0.8, 64, 1.5, 120, 67108864));
+            }
+            mode => panic!("expected PD mode with a decode policy, got {mode:?}"),
         }
     }
 }

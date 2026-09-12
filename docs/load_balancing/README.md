@@ -234,6 +234,28 @@ vllm-router --policy cache_aware \
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
 
+### Prefill/decode tuning
+
+In PD-disaggregated mode, each cache-aware stage can override the global cache settings independently. Any stage-specific option that is omitted falls back to its corresponding global option.
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+  --prefill-policy cache_aware \
+  --decode-policy cache_aware \
+  --prefill-cache-threshold 0.7 \
+  --prefill-balance-abs-threshold 48 \
+  --prefill-balance-rel-threshold 1.2 \
+  --prefill-eviction-interval 60 \
+  --prefill-max-tree-size 20000 \
+  --decode-cache-threshold 0.3 \
+  --decode-balance-abs-threshold 16 \
+  --decode-balance-rel-threshold 1.5 \
+  --decode-eviction-interval 120 \
+  --decode-max-tree-size 10000 \
+  --prefill http://prefill:8000 \
+  --decode http://decode:8000
+```
+
 ---
 
 ## Choosing a Policy
