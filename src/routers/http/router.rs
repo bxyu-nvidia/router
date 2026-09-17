@@ -546,7 +546,27 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let text = if policy.name() == "cache_aware" {
+            // Match the PD flow: prefix-match the serialized JSON request. Go
+            // through Value to use the same field ordering as the PD router.
+            // Chat's extract_text_for_routing only returns a session ID.
+            match serde_json::to_value(typed_req).and_then(|json| serde_json::to_string(&json)) {
+                Ok(text) => text,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Serialization error: {}", e),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            typed_req.extract_text_for_routing()
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1759,6 +1779,94 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_chat_matches_pd_request_content() {
+        use crate::config::types::PolicyConfig;
+        use crate::policies::CacheAwarePolicy;
+        use axum::{routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        let mut servers = Vec::new();
+        for name in ["cached", "idle"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app =
+                AxumRouter::new().route("/v1/chat/completions", post(move || async move { name }));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let worker = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+            if name == "cached" {
+                // Affinity must beat an idle worker, while below overload thresholds.
+                worker.increment_load();
+            }
+            router.worker_registry.register(worker);
+        }
+        let workers = router.worker_registry.get_all();
+        let cached = workers.iter().find(|w| w.load() == 1).unwrap().clone();
+
+        for model_id in [None, Some("unknown")] {
+            router.policy_registry = Arc::new(PolicyRegistry::new(if model_id.is_some() {
+                PolicyConfig::RoundRobin
+            } else {
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 10000,
+                }
+            }));
+            let policy = match model_id {
+                Some(model) => router
+                    .policy_registry
+                    .on_worker_added(model, Some("cache_aware")),
+                None => router.policy_registry.get_default_policy(),
+            };
+            policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .unwrap()
+                .init_workers(&workers);
+
+            for session in [None, Some("optional-session")] {
+                for stream in [false, true] {
+                    let mut body = serde_json::json!({
+                        "model": "unknown",
+                        "messages": [{"role": "user", "content": "repeated prompt"}],
+                        "stream": stream
+                    });
+                    if let Some(session) = session {
+                        body["session_params"] = serde_json::json!({"session_id": session});
+                    }
+                    let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                    // Warm the policy with exactly the input used by VllmPDRouter.
+                    let pd_json = serde_json::to_value(&request).unwrap();
+                    let pd_text = serde_json::to_string(&pd_json).unwrap();
+                    assert_eq!(
+                        policy.select_worker(std::slice::from_ref(&cached), Some(&pd_text)),
+                        Some(0)
+                    );
+
+                    let response = router.route_chat(None, &request, model_id).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+                    assert_eq!(
+                        body.as_ref(),
+                        b"cached",
+                        "PD cache affinity must survive non-PD routing"
+                    );
+                    assert_eq!(cached.load(), 1, "request load must be released");
+                }
+            }
+        }
+        for server in servers {
+            server.abort();
         }
     }
 

@@ -197,6 +197,11 @@ Requires at least 2 workers. With only 1 worker, behaves like direct routing.
 
 The `cache_aware` policy optimizes for prefix caching by maintaining an approximate radix tree of request prefixes per worker.
 
+Both regular (non-PD) and PD routing match prefixes of the serialized JSON request,
+including chat messages. No session ID is required. This is text prefix matching,
+not hashing the entire request into a digest; request fields outside the prompt can
+also affect the match.
+
 ### Configuration
 
 ```bash
