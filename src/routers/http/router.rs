@@ -428,7 +428,8 @@ impl Router {
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let url = format!("{}/{}", worker_url, endpoint);
+                let base_url = self.worker_base_url(&worker_url);
+                let url = format!("{}/{}", base_url, endpoint);
                 let route_name = format!("/{}", endpoint);
                 let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {
@@ -2117,6 +2118,71 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_get_models_with_four_worker_urls_and_dp_ranks() {
+        use crate::{config::RouterConfig, server::AppContext};
+        use axum::{routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let expected_models = serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "object": "model"}]
+        });
+        let mut worker_urls = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            worker_urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            let models = expected_models.clone();
+            let app = AxumRouter::new()
+                .route("/health", get(|| async { "ok" }))
+                .route(
+                    "/v1/models",
+                    get(move || {
+                        let models = models.clone();
+                        async move { Json(models) }
+                    }),
+                );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+
+        for dp_size in [1, 4] {
+            let config = RouterConfig {
+                intra_node_data_parallel_size: dp_size,
+                worker_startup_timeout_secs: 5,
+                worker_startup_check_interval_secs: 1,
+                ..Default::default()
+            };
+            let client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let ctx = Arc::new(AppContext::new(config, client, 100, None, vec![]).unwrap());
+            let router = Router::new(worker_urls.clone(), &ctx).await.unwrap();
+            assert_eq!(router.get_worker_urls().len(), 4 * dp_size);
+
+            let request = Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap();
+            let response = router.get_models(request).await;
+            assert_eq!(response.status(), StatusCode::OK, "DP size {dp_size}");
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                expected_models,
+                "DP size {dp_size} must fetch models from an actual worker"
+            );
+        }
+
+        for server in servers {
+            server.abort();
+        }
     }
 
     #[tokio::test]
