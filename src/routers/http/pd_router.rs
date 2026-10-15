@@ -635,7 +635,7 @@ impl PdRouterBase {
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
-        // At least one prefill and one decode are up
+        // Wait for every configured prefill and decode endpoint before serving.
         if !prefill_workers_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &prefill_workers_urls,
