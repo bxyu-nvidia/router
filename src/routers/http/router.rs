@@ -317,7 +317,7 @@ impl Router {
                 }
             }
 
-            if healthy_host_count > 0 {
+            if healthy_host_count == unique_hosts_vec.len() {
                 info!(
                     "{} out of {} unique hosts are healthy (representing {} workers)",
                     healthy_host_count,
@@ -327,7 +327,7 @@ impl Router {
                 return Ok(());
             } else {
                 debug!(
-                   "Waiting for at least 1 of {} unique hosts to become healthy ({} unhealthy: {:?})",
+                    "Waiting for all {} unique hosts to become healthy ({} unhealthy: {:?})",
                     unique_hosts_vec.len(),
                     unhealthy_hosts.len(),
                     unhealthy_hosts
@@ -2187,20 +2187,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_healthy_workers_all_healthy() {
-        let (url, _handle) = start_healthy_mock_server().await;
-        let result = Router::wait_for_healthy_workers(&[url], 5, 1).await;
+        let (first_url, first_handle) = start_healthy_mock_server().await;
+        let (second_url, second_handle) = start_healthy_mock_server().await;
+        let result = Router::wait_for_healthy_workers(&[first_url, second_url], 5, 1).await;
+        first_handle.abort();
+        second_handle.abort();
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_wait_for_healthy_workers_partial_health() {
-        // One healthy server + one unreachable URL.
-        // The new behaviour succeeds when at least one host is healthy.
-        let (healthy_url, _handle) = start_healthy_mock_server().await;
-        let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
+        // A healthy replica must not hide another replica that never becomes ready.
+        let (healthy_url, handle) = start_healthy_mock_server().await;
+        let (unhealthy_url, unhealthy_handle) =
+            start_delayed_healthy_mock_server(Duration::from_secs(60)).await;
 
-        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1).await;
-        assert!(result.is_ok());
+        let result =
+            Router::wait_for_healthy_workers(&[healthy_url, unhealthy_url.clone()], 1, 1).await;
+        handle.abort();
+        unhealthy_handle.abort();
+        let error = result.expect_err("Startup must time out while any worker is unhealthy");
+        assert!(error.contains("Timeout"));
+        assert!(error.contains(&unhealthy_url));
     }
 
     /// Helper: start a mock server that returns 503 on /health for a given
@@ -2276,14 +2284,23 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 503);
 
         // ── Step 1: wait_for_healthy_workers (mirrors PdRouterBase::new startup) ──
-        // This succeeds because the healthy worker responds immediately,
-        // even though the delayed worker is still returning 503.
+        // Startup must wait for the delayed worker as well as the healthy one.
         let result =
             Router::wait_for_healthy_workers(&[healthy_url.clone(), delayed_url.clone()], 10, 1)
                 .await;
         assert!(
             result.is_ok(),
-            "Startup should succeed with at least one healthy worker"
+            "Startup should succeed once both workers are healthy"
+        );
+        let resp = client
+            .get(format!("{}/health", delayed_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "Startup returned before all workers were ready"
         );
 
         // ── Step 2: register workers in the registry (mirrors PdRouterBase::new) ──
@@ -2325,8 +2342,8 @@ mod tests {
         let health_checker = registry.start_health_checker(1);
 
         // ── Step 4: wait for delayed worker to recover ──
-        // The mock server switches to 200 at t≈2s. With a 1s check interval
-        // and success_threshold=1, the worker should be healthy by t≈3-4s.
+        // The server is now ready. The background checker should restore
+        // the explicitly unhealthy worker with success_threshold=1.
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
         // Both workers should now be available for routing.
