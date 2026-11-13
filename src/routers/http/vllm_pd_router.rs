@@ -2,6 +2,7 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
+use super::pd_capture;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -502,6 +503,9 @@ impl VllmPDRouter {
                 }
             }
         }
+        if let Some(object) = request.as_object_mut() {
+            object.remove("nemo_rl_pd_capture");
+        }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
         // Remove stream_options since we're setting stream=false
@@ -709,6 +713,7 @@ impl VllmPDRouter {
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
+            pd_capture::merge(prefill_json_ref, &mut decode_json);
             let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
             if merged {
                 debug!("Successfully merged logprobs from prefill and decode responses");
@@ -721,7 +726,9 @@ impl VllmPDRouter {
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in resp_headers.iter() {
-                response_builder = response_builder.header(name, value);
+                if name != "content-length" && name != "transfer-encoding" {
+                    response_builder = response_builder.header(name, value);
+                }
             }
             return response_builder
                 .body(axum::body::Body::from(merged_body))
@@ -914,18 +921,23 @@ impl VllmPDRouter {
 
             debug!("Prefill response body: {}", prefill_response_text);
 
-            let prefill_json: Value = serde_json::from_str(&prefill_response_text)
+            let mut prefill_json: Value = serde_json::from_str(&prefill_response_text)
                 .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
 
             // Stop profiling on prefill server once we have its response.
             self.stop_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
+            pd_capture::attach_prefill(&request_json, &mut prefill_json)?;
             Some(prefill_json)
         };
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
+        pd_capture::prepare_decode(
+            &mut decode_request,
+            prefill_response_json.as_ref().unwrap_or(&Value::Null),
+        )?;
         let prefill_url_key = format!("http://{}", prefill_base_http);
         if let Some(params) = self
             .build_decode_kv_transfer_params(
@@ -1157,7 +1169,7 @@ impl VllmPDRouter {
     /// This function handles fine-grained load tracking: the prefill worker's load is only
     /// incremented during the prefill phase, and the decode worker's load is only incremented
     /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
-    /// 
+    ///
     /// In practice, we increment the decode worker's load as soon as we enter this function to avoid
     /// heavy imbalances under high concurrency due to the same decode worker being selected while
     /// waiting for the prefill request to finish.
@@ -1329,7 +1341,7 @@ impl VllmPDRouter {
         }
 
         // Parse prefill response to extract kv_transfer_params
-        let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
+        let mut prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
                 let duration = start_time.elapsed();
@@ -1341,6 +1353,9 @@ impl VllmPDRouter {
                 });
             }
         };
+
+        pd_capture::attach_prefill(&original_request, &mut prefill_response_json)
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
@@ -1365,6 +1380,8 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
+        pd_capture::prepare_decode(&mut decode_request, &prefill_response_json)
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
         if matches!(self.kv_connector, KvConnector::Mooncake) {
             // Mooncake: set decode params proactively from bootstrap info
             if let Some((bootstrap_addr, engine_id)) = self
@@ -1528,6 +1545,7 @@ impl VllmPDRouter {
                     message: format!("Failed to parse decode response as JSON: {}", e),
                 })?;
 
+            pd_capture::merge(&prefill_response_json, &mut decode_json);
             // Merge logprobs from prefill into decode response
             let merged =
                 logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
@@ -2895,13 +2913,12 @@ mod tests {
         ];
 
         // Force cache-miss routing so selection is determined by worker load.
-        let policy = crate::policies::CacheAwarePolicy::with_config(
-            crate::policies::CacheAwareConfig {
+        let policy =
+            crate::policies::CacheAwarePolicy::with_config(crate::policies::CacheAwareConfig {
                 cache_threshold: 1.0,
                 eviction_interval_secs: 0,
                 ..Default::default()
-            },
-        );
+            });
         policy.init_workers(&decode_workers);
 
         let first_idx = policy

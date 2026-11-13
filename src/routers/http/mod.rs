@@ -2,6 +2,7 @@
 
 pub mod dp_utils;
 pub mod logprobs_merge;
+mod pd_capture;
 pub mod openai_router;
 pub mod pd_router;
 pub mod pd_types;
