@@ -888,7 +888,25 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         if !config.router_config.mode.is_pd_mode() {
             return Err("Managed RL admission requires a PD router".into());
         }
-        app_context.pd_admission = Some(crate::pd_admission::PDAdmission::new(token)?);
+        let capture = std::env::var("NEMO_RL_PD_CAPTURE_URL")
+            .ok()
+            .map(|url| {
+                let timeout = std::env::var("NEMO_RL_PD_CAPTURE_TIMEOUT_SECONDS")
+                    .map_err(|_| {
+                        "PD capture requires NEMO_RL_PD_CAPTURE_TIMEOUT_SECONDS".to_string()
+                    })?
+                    .parse::<u64>()
+                    .map_err(|e| e.to_string())?;
+                crate::pd_capture_rpc::CaptureClient::new(
+                    url,
+                    token.clone(),
+                    std::time::Duration::from_secs(timeout),
+                )
+            })
+            .transpose()?;
+        app_context.pd_admission = Some(crate::pd_admission::PDAdmission::with_capture(
+            token, capture,
+        )?);
     }
     println!("DEBUG: AppContext created");
 

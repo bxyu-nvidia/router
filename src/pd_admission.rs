@@ -34,17 +34,26 @@ struct AdmissionState {
 
 pub struct PDAdmission {
     token: String,
+    capture: Option<crate::pd_capture_rpc::CaptureClient>,
     state: Mutex<AdmissionState>,
     changed: Notify,
 }
 
 impl PDAdmission {
     pub fn new(token: String) -> Result<Arc<Self>, String> {
+        Self::with_capture(token, None)
+    }
+
+    pub fn with_capture(
+        token: String,
+        capture: Option<crate::pd_capture_rpc::CaptureClient>,
+    ) -> Result<Arc<Self>, String> {
         if token.trim().is_empty() {
             return Err("NEMO_RL_PD_CONTROL_TOKEN must not be empty".into());
         }
         Ok(Arc::new(Self {
             token,
+            capture,
             state: Mutex::new(AdmissionState {
                 paused: false,
                 active: 0,
@@ -182,7 +191,7 @@ async fn control(
         ControlRequest::Resume => gate.resume(),
     };
     match result {
-        Ok(()) => Json(json!({"ok": true, "version": 1, "state": gate.state.lock().clone()}))
+        Ok(()) => Json(json!({"ok": true, "version": 1, "capture_protocol": gate.capture.as_ref().map(|_| 1), "state": gate.state.lock().clone()}))
             .into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
     }
@@ -226,7 +235,11 @@ pub async fn middleware(
     // when the response or its stream receiver has already been dropped.
     let (headers_tx, headers_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let response = next.run(request).await;
+        let response = if let Some(capture) = &admission.gate.capture {
+            capture.run(request, next, admission.weight_version).await
+        } else {
+            next.run(request).await
+        };
         if response.status().is_server_error() {
             admission
                 .gate
@@ -519,5 +532,195 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    struct CaptureMock {
+        seen: Mutex<Vec<(String, serde_json::Value)>>,
+        completing: Semaphore,
+        finish: Semaphore,
+        complete_status: StatusCode,
+    }
+
+    async fn capture_app(
+        downstream: Router,
+        status: StatusCode,
+        permits: usize,
+    ) -> (
+        Router,
+        Arc<PDAdmission>,
+        Arc<CaptureMock>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mock = Arc::new(CaptureMock {
+            seen: Mutex::new(Vec::new()),
+            completing: Semaphore::new(0),
+            finish: Semaphore::new(permits),
+            complete_status: status,
+        });
+        let backend = Router::new().route("/{operation}", post(
+            |State(mock): State<Arc<CaptureMock>>, axum::extract::Path(operation): axum::extract::Path<String>, headers: HeaderMap, Json(mut body): Json<serde_json::Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer control-secret");
+                mock.seen.lock().push((operation.clone(), body.clone()));
+                if operation == "prepare" {
+                    if body.get("bad_sampling").is_some() { return StatusCode::BAD_REQUEST.into_response(); }
+                    body.as_object_mut().unwrap().remove("ng_capture");
+                    body["required_prefix_token_ids"] = json!([4, 5]);
+                    return Json(body).into_response();
+                }
+                assert_eq!(operation, "complete");
+                mock.completing.add_permits(1);
+                mock.finish.acquire().await.unwrap().forget();
+                if mock.complete_status != StatusCode::OK { return mock.complete_status.into_response(); }
+                let mut response = body["response"].clone();
+                response["ng_commit_coords"] = json!({"disposition": "staged", "weight_version": body["weight_version"]});
+                Json(response).into_response()
+            }
+        )).with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+        let capture = crate::pd_capture_rpc::CaptureClient::new(
+            url,
+            "control-secret".into(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let gate = PDAdmission::with_capture("control-secret".into(), Some(capture)).unwrap();
+        (app(Some(gate.clone()), downstream), gate, mock, task)
+    }
+
+    fn captured_request(extra: serde_json::Value) -> Request {
+        let mut body = json!({"messages": [{"role":"user", "content":"hello"}], "tools": [{"type":"function"}], "ng_capture": {"model_call_id":"c1"}});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-session-id", "session")
+            .header("content-length", body.to_string().len())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_rpc_preserves_chat_and_stages_with_router_epoch() {
+        let downstream = Router::new().route("/v1/chat/completions", post(|headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(headers["x-session-id"], "session");
+            assert!(!headers.contains_key("content-length"));
+            assert_eq!(body["messages"][0]["content"], "hello");
+            assert_eq!(body["tools"][0]["type"], "function");
+            assert_eq!(body["required_prefix_token_ids"], json!([4, 5]));
+            assert!(body.get("ng_capture").is_none());
+            Json(json!({"choices": [{"message": {"content": "world"}}], "nemo_rl_pd_capture": {"prefill": "routes"}}))
+        }));
+        let (app, gate, mock, task) = capture_app(downstream, StatusCode::OK, 1).await;
+        gate.pause().await.unwrap();
+        gate.set_version(7).unwrap();
+        gate.resume().unwrap();
+        let response = app.oneshot(captured_request(json!({}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[WEIGHT_VERSION_HEADER], "7");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ng_commit_coords"]["weight_version"], 7);
+        assert_eq!(body["choices"][0]["message"]["content"], "world");
+        gate.pause().await.unwrap();
+        let seen = mock.seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].1["admission"]["model_call_id"], "c1");
+        assert_eq!(
+            seen[1].1["response"]["nemo_rl_pd_capture"]["prefill"],
+            "routes"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn capture_rpc_keeps_drain_closed_until_staging_finishes_after_disconnect() {
+        let downstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(json!({"choices": []})) }),
+        );
+        let (app, gate, mock, task) = capture_app(downstream, StatusCode::OK, 0).await;
+        let request = tokio::spawn(app.oneshot(captured_request(json!({}))));
+        mock.completing.acquire().await.unwrap().forget();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let pause = gate.pause();
+        tokio::pin!(pause);
+        assert!(futures::poll!(&mut pause).is_pending());
+        assert!(gate.set_version(8).is_err());
+        mock.finish.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause)
+            .await
+            .unwrap()
+            .unwrap();
+        gate.set_version(8).unwrap();
+        assert_eq!(mock.seen.lock()[1].1["weight_version"], 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn capture_rpc_never_retries_ambiguous_staging_and_blocks_refit() {
+        let downstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(json!({"choices": []})) }),
+        );
+        let (app, gate, mock, task) =
+            capture_app(downstream, StatusCode::INTERNAL_SERVER_ERROR, 1).await;
+        let response = app.oneshot(captured_request(json!({}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        consume(response).await;
+        assert!(gate.pause().await.is_err());
+        assert!(gate.resume().is_err());
+        assert_eq!(mock.seen.lock().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn capture_rpc_preserves_context_errors_and_rejects_bad_requests_before_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let downstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error":{"message":"maximum context length exceeded"}})),
+                    )
+                }
+            }),
+        );
+        let (app, gate, mock, task) = capture_app(downstream, StatusCode::OK, 1).await;
+        for extra in [json!({"stream": true}), json!({"bad_sampling": true})] {
+            let response = app.clone().oneshot(captured_request(extra)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            consume(response).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = app.oneshot(captured_request(json!({}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("maximum context length exceeded"));
+        gate.pause().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(mock
+            .seen
+            .lock()
+            .iter()
+            .all(|(operation, _)| operation == "prepare"));
+        task.abort();
     }
 }
