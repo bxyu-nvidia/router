@@ -40,6 +40,7 @@ use tracing::{error, info, warn, Level};
 
 #[derive(Clone)]
 pub struct AppContext {
+    pub pd_admission: Option<Arc<crate::pd_admission::PDAdmission>>,
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
@@ -74,6 +75,7 @@ impl AppContext {
         };
 
         Ok(Self {
+            pd_admission: None,
             client,
             router_config,
             rate_limiter,
@@ -771,6 +773,13 @@ pub fn build_app_with_request_tracing(
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .merge(crate::pd_admission::routes(
+            app_state.context.pd_admission.clone(),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.context.pd_admission.clone(),
+            crate::pd_admission::middleware,
+        ))
         // Request body size limiting
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -868,13 +877,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Create the application context with all dependencies
     println!("DEBUG: Creating AppContext");
-    let app_context = AppContext::new(
+    let mut app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
         config.router_config.api_key_validation_urls.clone(),
     )?;
+    if let Ok(token) = std::env::var("NEMO_RL_PD_CONTROL_TOKEN") {
+        if !config.router_config.mode.is_pd_mode() {
+            return Err("Managed RL admission requires a PD router".into());
+        }
+        app_context.pd_admission = Some(crate::pd_admission::PDAdmission::new(token)?);
+    }
     println!("DEBUG: AppContext created");
 
     let app_context = Arc::new(app_context);
