@@ -503,9 +503,7 @@ impl VllmPDRouter {
                 }
             }
         }
-        if let Some(object) = request.as_object_mut() {
-            object.remove("nemo_rl_pd_capture");
-        }
+        pd_capture::prepare_prefill(&mut request);
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
         // Remove stream_options since we're setting stream=false
@@ -698,8 +696,14 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+        if (needs_logprobs
+            || prefill_response_json
+                .and_then(pd_capture::metadata)
+                .is_some())
+            && !is_streaming
+            && decode_response.status().is_success()
+        {
+            debug!("Merging prefill metadata into non-streaming decode response");
 
             let status = decode_response.status();
             let resp_headers = decode_response.headers().clone();
@@ -713,12 +717,15 @@ impl VllmPDRouter {
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            pd_capture::merge(prefill_json_ref, &mut decode_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            pd_capture::merge(prefill_json_ref, &mut decode_json)?;
+            if pd_capture::metadata(prefill_json_ref).is_none() {
+                if logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json) {
+                    debug!("Successfully merged logprobs from prefill and decode responses");
+                } else {
+                    warn!(
+                        "No logprobs were merged (might be expected if logprobs not in response)"
+                    );
+                }
             }
 
             let merged_body = serde_json::to_vec(&decode_json)
@@ -750,7 +757,18 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = if status.is_success() {
+                if let Some(metadata) = prefill_response_json.and_then(pd_capture::metadata) {
+                    Body::from_stream(pd_capture::stream(
+                        decode_response.bytes_stream(),
+                        metadata.clone(),
+                    ))
+                } else {
+                    Body::from_stream(decode_response.bytes_stream())
+                }
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -783,6 +801,14 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, String> {
+        if let Err(reason) = pd_capture::validate(
+            &request_json,
+            path,
+            matches!(self.kv_connector, KvConnector::Nixl),
+        ) {
+            return Ok((StatusCode::BAD_REQUEST, reason).into_response());
+        }
+
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
 
@@ -1181,6 +1207,14 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
+        if let Err(reason) = pd_capture::validate(
+            &original_request,
+            path,
+            matches!(self.kv_connector, KvConnector::Nixl),
+        ) {
+            return Ok((StatusCode::BAD_REQUEST, reason).into_response());
+        }
+
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
         debug!(
@@ -1524,8 +1558,11 @@ impl VllmPDRouter {
             .unwrap_or(false);
 
         // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+        if (needs_logprobs || pd_capture::metadata(&prefill_response_json).is_some())
+            && !is_streaming
+            && status.is_success()
+        {
+            debug!("Merging prefill metadata into non-streaming decode response");
 
             // Read decode response body
             let decode_body =
@@ -1545,14 +1582,18 @@ impl VllmPDRouter {
                     message: format!("Failed to parse decode response as JSON: {}", e),
                 })?;
 
-            pd_capture::merge(&prefill_response_json, &mut decode_json);
+            pd_capture::merge(&prefill_response_json, &mut decode_json)
+                .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
             // Merge logprobs from prefill into decode response
-            let merged =
-                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            if pd_capture::metadata(&prefill_response_json).is_none() {
+                if logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json)
+                {
+                    debug!("Successfully merged logprobs from prefill and decode responses");
+                } else {
+                    warn!(
+                        "No logprobs were merged (might be expected if logprobs not in response)"
+                    );
+                }
             }
 
             // Serialize merged response
@@ -1587,7 +1628,18 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = if is_streaming && status.is_success() {
+                if let Some(metadata) = pd_capture::metadata(&prefill_response_json) {
+                    Body::from_stream(pd_capture::stream(
+                        decode_response.bytes_stream(),
+                        metadata.clone(),
+                    ))
+                } else {
+                    Body::from_stream(decode_response.bytes_stream())
+                }
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -3034,5 +3086,124 @@ mod tests {
             0,
             "the prefill load must have been released at the transition"
         );
+    }
+    /// Exercise the real HTTP dispatch and response paths in both routing modes.
+    #[tokio::test]
+    async fn pd_chat_capture_http_preserves_alignment_and_decode_outputs() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        for discovered in [false, true] {
+            for streaming in [false, true] {
+                let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let prefill_address = prefill_listener.local_addr().unwrap();
+                let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let decode_address = decode_listener.local_addr().unwrap();
+                let prefill_app = axum::Router::new().route("/v1/chat/completions", post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
+                    assert_eq!(body["return_token_ids"], true);
+                    assert_eq!(body["stream"], false);
+                    assert_eq!(body["max_tokens"], 1);
+                    assert!(body.get("nemo_rl_pd_capture").is_none());
+                    Json(json!({"prompt_token_ids": [11, 12, 13],
+                        "kv_transfer_params": {"remote_num_tokens": 2},
+                        "choices": [{"index": 0, "token_ids": [999], "routed_experts": "prefill-routes"}]}))
+                }));
+                let decode_json = json!({"prompt_token_ids": [11, 12, 13],
+                    "choices": [{"index": 0, "message": {"content": "hello"}, "token_ids": [14],
+                        "logprobs": {"content": [{"token": "token_id:14", "logprob": -0.1}]},
+                        "routed_experts": "decode-routes", "finish_reason": "stop"}]});
+                let expected_choices = decode_json["choices"].clone();
+                let decode_app = axum::Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                    let response = decode_json.clone();
+                    async move {
+                        assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
+                        assert_eq!(body["routed_experts_prompt_start"], 2);
+                        assert_eq!(body["return_token_ids"], true);
+                        assert_eq!(body["max_tokens"], 8);
+                        assert_eq!(body["kv_transfer_params"]["remote_num_tokens"], 2);
+                        assert!(body.get("nemo_rl_pd_capture").is_none());
+                        if streaming {
+                            let raw = format!("data: {{\"prompt_token_ids\":[11,12,13],\"choices\":[]}}\n\ndata: {}\n\ndata: [DONE]\n\n", response);
+                            ([("content-type", "text/event-stream")], raw).into_response()
+                        } else { Json(response).into_response() }
+                    }
+                }));
+                let prefill_server = tokio::spawn(async move {
+                    axum::serve(prefill_listener, prefill_app).await.unwrap()
+                });
+                let decode_server =
+                    tokio::spawn(
+                        async move { axum::serve(decode_listener, decode_app).await.unwrap() },
+                    );
+                let router = test_vllm_pd_router();
+                // Roundtrip the public request type to catch lost extension fields.
+                let typed: crate::protocols::spec::ChatCompletionRequest =
+                    serde_json::from_value(json!({
+                        "messages": [{"role": "user", "content": "hi"}], "model": "test",
+                        "required_prefix_token_ids": [11, 12], "nemo_rl_pd_capture": true,
+                        "return_token_ids": false, "max_tokens": 8, "stream": streaming,
+                        "logprobs": false
+                    }))
+                    .unwrap();
+                let mut request = serde_json::to_value(typed).unwrap();
+                // Regression: capture metadata must survive without any logprobs field.
+                request.as_object_mut().unwrap().remove("logprobs");
+                let response = if discovered {
+                    router
+                        .process_vllm_two_stage_request_discovered(
+                            request,
+                            &(prefill_address.to_string(), "p".into()),
+                            &(decode_address.to_string(), "d".into()),
+                            "/v1/chat/completions",
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    router
+                        .process_vllm_two_stage_request(
+                            request,
+                            Arc::new(BasicWorker::new(
+                                format!("http://{prefill_address}"),
+                                WorkerType::Prefill {
+                                    bootstrap_port: None,
+                                },
+                            )),
+                            Arc::new(BasicWorker::new(
+                                format!("http://{decode_address}"),
+                                WorkerType::Decode,
+                            )),
+                            "/v1/chat/completions",
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                };
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+                let payload: Value = if streaming {
+                    std::str::from_utf8(&body)
+                        .unwrap()
+                        .split("\n\n")
+                        .filter_map(|f| f.strip_prefix("data: "))
+                        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+                        .find(|f| f.get("nemo_rl_pd_capture").is_some())
+                        .unwrap()
+                } else {
+                    serde_json::from_slice(&body).unwrap()
+                };
+                assert_eq!(payload["choices"], expected_choices);
+                assert_eq!(payload["nemo_rl_pd_capture"]["decode_route_start"], 2);
+                assert_eq!(
+                    payload["nemo_rl_pd_capture"]["prefill"]["routed_experts"],
+                    "prefill-routes"
+                );
+                prefill_server.abort();
+                decode_server.abort();
+            }
+        }
     }
 }
