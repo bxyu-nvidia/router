@@ -155,9 +155,13 @@ pub fn attach_prefill(request: &Value, response: &mut Value) -> Result<(), Strin
         .get("routed_experts_prompt_start")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if prompt_start > start as u64 {
-        return Err("PD routed_experts_prompt_start exceeds the transfer boundary".into());
+    if prompt_start >= prompt_len as u64 {
+        return Err("PD routed_experts_prompt_start exceeds the last prompt token".into());
     }
+    // KV transfer can back off before the committed parent (e.g. Mamba block
+    // alignment). Decode recomputes those tokens, but their routes are already
+    // staged. Return only the suffix needed by this call, including its boundary.
+    let start = start.max(prompt_start as usize);
     let routes = choice(response)?
         .get("routed_experts")
         .filter(|v| v.is_string())
@@ -387,6 +391,30 @@ mod tests {
             final_response["nemo_rl_pd_capture"]["decode_route_start"],
             2
         );
+    }
+
+    #[test]
+    fn kv_backoff_before_parent_captures_only_the_needed_decode_suffix() {
+        for transfer_end in [0, 1, 2, 3] {
+            let mut request = chat_request();
+            request["routed_experts_prompt_start"] = json!(1);
+            let mut response = prefill();
+            response["kv_transfer_params"]["remote_num_tokens"] = json!(transfer_end);
+            attach_prefill(&request, &mut response).unwrap();
+            let start = transfer_end.clamp(1, 2);
+            assert_eq!(response["nemo_rl_pd_capture"]["decode_route_start"], start);
+            assert_eq!(
+                response["nemo_rl_pd_capture"]["prefill_route_end"],
+                transfer_end
+            );
+            prepare_decode(&mut request, &response).unwrap();
+            assert_eq!(request["routed_experts_prompt_start"], start);
+            let mut final_response = decode();
+            merge(&response, &mut final_response).unwrap();
+        }
+        let mut request = chat_request();
+        request["routed_experts_prompt_start"] = json!(3);
+        assert!(attach_prefill(&request, &mut prefill()).is_err());
     }
 
     #[test]
