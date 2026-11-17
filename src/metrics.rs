@@ -126,6 +126,11 @@ pub fn init_metrics() {
         "PD request duration by route"
     );
 
+    describe_histogram!(
+        "vllm_router_pd_capture_rpc_duration_seconds",
+        "Capture RPC duration including JSON encoding, connection waits, and response decoding, by operation and outcome"
+    );
+
     // Service discovery metrics
     describe_counter!(
         "vllm_router_discovery_updates_total",

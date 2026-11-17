@@ -3,7 +3,7 @@
 
 //! Capture RPC to the RL-owned CPU service. No model rendering or TQ dependency.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -51,7 +51,21 @@ impl CaptureClient {
         })
     }
 
-    async fn rpc(&self, operation: &str, body: &Value) -> Result<Value, Response> {
+    async fn rpc(&self, operation: &'static str, body: &Value) -> Result<Value, Response> {
+        // Include request serialization, connection waits, service time, and
+        // response-body receipt/JSON decoding, not just time to HTTP headers.
+        let started = Instant::now();
+        let result = self.rpc_inner(operation, body).await;
+        metrics::histogram!(
+            "vllm_router_pd_capture_rpc_duration_seconds",
+            "operation" => operation,
+            "outcome" => if result.is_ok() { "success" } else { "error" },
+        )
+        .record(started.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn rpc_inner(&self, operation: &str, body: &Value) -> Result<Value, Response> {
         let result = self
             .client
             .post(format!("{}/{operation}", self.url))
@@ -163,4 +177,157 @@ impl CaptureClient {
 
 fn failure(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": {"message": message}}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Router};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::{
+        convert::Infallible,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tokio::{net::TcpListener, task::JoinHandle};
+
+    async fn mock_capture(
+        status: StatusCode,
+        payload: &'static str,
+        delay: Duration,
+        timeout: Duration,
+    ) -> (CaptureClient, Arc<AtomicUsize>, JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new().route(
+            "/{operation}",
+            post(move || {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // Send headers first, then delay the body: timing only
+                    // send().await would miss this part of the round trip.
+                    let body = Body::from_stream(futures_util::stream::once(async move {
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, Infallible>(payload)
+                    }));
+                    Response::builder().status(status).body(body).unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = CaptureClient::new(format!("http://{addr}"), "test".into(), timeout).unwrap();
+        (client, calls, server)
+    }
+
+    fn sample(text: &str, suffix: &str, operation: &str, outcome: &str) -> f64 {
+        let name = format!("vllm_router_pd_capture_rpc_duration_seconds_{suffix}{{");
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                line.starts_with(&name)
+                    && line.contains(&format!("operation=\"{operation}\""))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "missing or duplicate sample: {text}");
+        lines[0].split_whitespace().last().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_timing_includes_response_body_for_both_operations() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets(&[0.01, 0.1, 1.0])
+            .unwrap()
+            .build_recorder();
+        // The default test runtime is current-thread, keeping the recorder
+        // scoped to this test even while awaiting HTTP responses.
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let delay = Duration::from_millis(30);
+        let (client, calls, server) =
+            mock_capture(StatusCode::OK, "{}", delay, Duration::from_secs(5)).await;
+        for operation in ["prepare", "complete"] {
+            assert_eq!(client.rpc(operation, &json!({})).await.unwrap(), json!({}));
+        }
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let text = recorder.handle().render();
+        for operation in ["prepare", "complete"] {
+            assert_eq!(sample(&text, "count", operation, "success"), 1.0);
+            assert!(sample(&text, "sum", operation, "success") >= delay.as_secs_f64());
+        }
+        assert!(!text.contains("outcome=\"error\""));
+    }
+
+    #[tokio::test]
+    async fn failed_rpc_is_timed_once_without_retrying() {
+        for (status, payload, delay, timeout, operation, expected_status) in [
+            (
+                StatusCode::BAD_REQUEST,
+                "{}",
+                0,
+                5000,
+                "prepare",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{}",
+                0,
+                5000,
+                "complete",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                StatusCode::OK,
+                "not json",
+                30,
+                5000,
+                "complete",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                StatusCode::OK,
+                "{}",
+                1000,
+                30,
+                "prepare",
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets(&[0.01, 0.1, 1.0])
+                .unwrap()
+                .build_recorder();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (client, calls, server) = mock_capture(
+                status,
+                payload,
+                Duration::from_millis(delay),
+                Duration::from_millis(timeout),
+            )
+            .await;
+            assert_eq!(
+                client
+                    .rpc(operation, &json!({}))
+                    .await
+                    .unwrap_err()
+                    .status(),
+                expected_status
+            );
+            server.abort();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let text = recorder.handle().render();
+            assert_eq!(sample(&text, "count", operation, "error"), 1.0);
+            if delay > 0 {
+                assert!(sample(&text, "sum", operation, "error") >= 0.03);
+            }
+            assert!(!text.contains("outcome=\"success\""));
+        }
+    }
 }
