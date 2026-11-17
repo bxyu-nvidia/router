@@ -55,7 +55,7 @@ impl CaptureClient {
         // Include request serialization, connection waits, service time, and
         // response-body receipt/JSON decoding, not just time to HTTP headers.
         let started = Instant::now();
-        let result = self.rpc_inner(operation, body).await;
+        let result = self.rpc_inner(operation, body, started).await;
         metrics::histogram!(
             "vllm_router_pd_capture_rpc_duration_seconds",
             "operation" => operation,
@@ -65,7 +65,12 @@ impl CaptureClient {
         result
     }
 
-    async fn rpc_inner(&self, operation: &str, body: &Value) -> Result<Value, Response> {
+    async fn rpc_inner(
+        &self,
+        operation: &str,
+        body: &Value,
+        started: Instant,
+    ) -> Result<Value, Response> {
         let result = self
             .client
             .post(format!("{}/{operation}", self.url))
@@ -76,7 +81,17 @@ impl CaptureClient {
         let response = match result {
             Ok(response) => response,
             Err(error) => {
-                tracing::error!(%operation, %error, "PD capture RPC failed; will not retry");
+                tracing::error!(
+                    %operation,
+                    phase = "send",
+                    elapsed_seconds = started.elapsed().as_secs_f64(),
+                    error = ?error,
+                    is_timeout = error.is_timeout(),
+                    is_connect = error.is_connect(),
+                    is_body = error.is_body(),
+                    is_decode = error.is_decode(),
+                    "PD capture RPC failed; will not retry"
+                );
                 return Err(failure(StatusCode::BAD_GATEWAY, "PD capture RPC failed"));
             }
         };
@@ -95,7 +110,19 @@ impl CaptureClient {
             ));
         }
         response.json::<Value>().await.map_err(|error| {
-            tracing::error!(%operation, %error, "Invalid PD capture RPC response");
+            // Debug includes reqwest's nested transport source; Display hides it.
+            // Do not log headers or the capture payload (tokens and credentials).
+            tracing::error!(
+                %operation,
+                phase = "response_body",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                error = ?error,
+                is_timeout = error.is_timeout(),
+                is_connect = error.is_connect(),
+                is_body = error.is_body(),
+                is_decode = error.is_decode(),
+                "Invalid PD capture RPC response; will not retry"
+            );
             failure(StatusCode::BAD_GATEWAY, "Invalid PD capture RPC response")
         })
     }
@@ -329,5 +356,89 @@ mod tests {
             }
             assert!(!text.contains("outcome=\"success\""));
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_logs_include_sources_and_phase_without_payloads() {
+        let logs = LogWriter::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Accept the connection, read the HTTP request, then close it without
+        // responding: reqwest's Display hides the underlying hyper error.
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            stream.read(&mut bytes).await.unwrap();
+        });
+        let client = CaptureClient::new(
+            format!("http://{addr}"),
+            "private-token-marker".into(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let failure = client
+            .rpc("complete", &json!({"secret": "private-body-marker"}))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.status(), StatusCode::BAD_GATEWAY);
+        server.await.unwrap();
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("operation=complete"), "{text}");
+        assert!(text.contains("phase=\"send\""), "{text}");
+        assert!(
+            text.contains("source:") && text.contains("hyper::Error"),
+            "{text}"
+        );
+        assert!(text.contains("elapsed_seconds="), "{text}");
+        assert!(text.contains("is_timeout=false"), "{text}");
+        assert!(!text.contains("private-token-marker") && !text.contains("private-body-marker"));
+
+        logs.0.lock().unwrap().clear();
+        let (client, calls, server) = mock_capture(
+            StatusCode::OK,
+            "{}",
+            Duration::from_secs(1),
+            Duration::from_millis(30),
+        )
+        .await;
+        assert_eq!(
+            client
+                .rpc("prepare", &json!({}))
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("phase=\"response_body\""), "{text}");
+        assert!(
+            text.contains("is_timeout=true") && text.contains("source:"),
+            "{text}"
+        );
     }
 }
