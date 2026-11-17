@@ -4,6 +4,7 @@ pub mod dp_utils;
 pub mod logprobs_merge;
 pub mod openai_router;
 mod pd_capture;
+mod pd_raw;
 pub mod pd_router;
 pub mod pd_types;
 pub mod router;

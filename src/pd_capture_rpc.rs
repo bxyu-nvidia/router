@@ -13,9 +13,26 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::{json, Value};
+use bytes::Bytes;
+use futures_util::StreamExt;
+use serde_json::{json, value::RawValue};
+use std::collections::BTreeMap;
 
 const MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Internal extension set only after a successful authenticated /prepare RPC.
+#[derive(Clone)]
+pub(crate) struct ManagedCapture;
+
+/// Opaque prefill routes carried alongside the unchanged decode response body.
+#[derive(Clone)]
+pub(crate) struct PrefillCapture(pub std::sync::Arc<RawValue>);
+
+impl AsRef<[u8]> for PrefillCapture {
+    fn as_ref(&self) -> &[u8] {
+        self.0.get().as_bytes()
+    }
+}
 
 pub struct CaptureClient {
     url: String,
@@ -51,9 +68,13 @@ impl CaptureClient {
         })
     }
 
-    async fn rpc(&self, operation: &'static str, body: &Value) -> Result<Value, Response> {
-        // Include request serialization, connection waits, service time, and
-        // response-body receipt/JSON decoding, not just time to HTTP headers.
+    async fn rpc(
+        &self,
+        operation: &'static str,
+        body: impl Into<reqwest::Body>,
+    ) -> Result<Bytes, Response> {
+        // Include body transfer, connection waits, service time, and response
+        // receipt/validation, not just time to HTTP headers.
         let started = Instant::now();
         let result = self.rpc_inner(operation, body, started).await;
         metrics::histogram!(
@@ -68,19 +89,21 @@ impl CaptureClient {
     async fn rpc_inner(
         &self,
         operation: &str,
-        body: &Value,
+        body: impl Into<reqwest::Body>,
         started: Instant,
-    ) -> Result<Value, Response> {
+    ) -> Result<Bytes, Response> {
         let result = self
             .client
             .post(format!("{}/{operation}", self.url))
             .bearer_auth(&self.token)
-            .json(body)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await;
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                log_socket_exhaustion(operation, "send", &error);
                 tracing::error!(
                     %operation,
                     phase = "send",
@@ -109,7 +132,8 @@ impl CaptureClient {
                 "PD capture RPC rejected the call; see RL service logs",
             ));
         }
-        response.json::<Value>().await.map_err(|error| {
+        let bytes = response.bytes().await.map_err(|error| {
+            log_socket_exhaustion(operation, "response_body", &error);
             // Debug includes reqwest's nested transport source; Display hides it.
             // Do not log headers or the capture payload (tokens and credentials).
             tracing::error!(
@@ -124,7 +148,31 @@ impl CaptureClient {
                 "Invalid PD capture RPC response; will not retry"
             );
             failure(StatusCode::BAD_GATEWAY, "Invalid PD capture RPC response")
-        })
+        })?;
+        // Inspect the envelope, never materialize the token/logprob fields.
+        let fields: BTreeMap<String, &RawValue> =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                tracing::error!(%operation, phase = "response_body", error = ?error,
+                "Invalid PD capture RPC response; will not retry");
+                failure(StatusCode::BAD_GATEWAY, "Invalid PD capture RPC response")
+            })?;
+        if operation == "prepare" && fields.contains_key("ng_capture") {
+            return Err(failure(
+                StatusCode::BAD_GATEWAY,
+                "Invalid prepared capture request",
+            ));
+        }
+        if operation == "complete"
+            && !fields
+                .get("ng_commit_coords")
+                .is_some_and(|v| v.get().starts_with('{'))
+        {
+            return Err(failure(
+                StatusCode::BAD_GATEWAY,
+                "Capture response lacks commit coordinates",
+            ));
+        }
+        Ok(bytes)
     }
 
     pub async fn run(&self, request: Request, next: Next, weight_version: u64) -> Response {
@@ -136,29 +184,37 @@ impl CaptureClient {
             Ok(bytes) => bytes,
             Err(_) => return failure(StatusCode::PAYLOAD_TOO_LARGE, "Cannot read PD request body"),
         };
-        let original: Value = match serde_json::from_slice(&bytes) {
+        let original: BTreeMap<String, &RawValue> = match serde_json::from_slice(&bytes) {
             Ok(body) => body,
             Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid chat JSON"),
         };
-        let Some(admission) = original.get("ng_capture").filter(|value| !value.is_null()) else {
+        let Some(admission) = original
+            .get("ng_capture")
+            .filter(|value| value.get() != "null")
+        else {
             return next
                 .run(Request::from_parts(parts, Body::from(bytes)))
                 .await;
         };
-        if original.get("stream").and_then(Value::as_bool) == Some(true) {
+        if original
+            .get("stream")
+            .is_some_and(|value| value.get() == "true")
+        {
             return failure(
                 StatusCode::BAD_REQUEST,
                 "Managed PD capture requires stream=false",
             );
         }
-        let prepared = match self.rpc("prepare", &original).await {
-            Ok(body) if body.is_object() && body.get("ng_capture").is_none() => body,
-            Ok(_) => return failure(StatusCode::BAD_GATEWAY, "Invalid prepared capture request"),
+        let admission = (*admission).to_owned();
+        drop(original);
+        let prepared = match self.rpc("prepare", bytes).await {
+            Ok(body) => body,
             Err(error) => return error,
         };
         parts.headers.remove(header::CONTENT_LENGTH);
+        parts.extensions.insert(ManagedCapture);
         let response = next
-            .run(Request::from_parts(parts, Body::from(prepared.to_string())))
+            .run(Request::from_parts(parts, Body::from(prepared)))
             .await;
         if !response.status().is_success() {
             // Preserve context-length and other engine errors verbatim. Nothing
@@ -166,30 +222,43 @@ impl CaptureClient {
             return response;
         }
         let (mut parts, body) = response.into_parts();
-        let bytes = match to_bytes(body, MAX_BODY_BYTES).await {
-            Ok(bytes) => bytes,
-            Err(_) => return failure(StatusCode::BAD_GATEWAY, "Cannot read PD capture response"),
-        };
-        let payload: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => return failure(StatusCode::BAD_GATEWAY, "Invalid PD capture response JSON"),
-        };
-        let completed = match self
-            .rpc(
-                "complete",
-                &json!({
-                    "admission": admission, "response": payload, "weight_version": weight_version,
-                }),
-            )
-            .await
-        {
-            Ok(value) if value.get("ng_commit_coords").is_some_and(Value::is_object) => value,
-            Ok(_) => {
-                return failure(
-                    StatusCode::BAD_GATEWAY,
-                    "Capture response lacks commit coordinates",
-                )
+        // Stream the engine body into the envelope. Backpressure from the
+        // capture worker bounds buffering instead of retaining a full response
+        // for each of the potentially thousands of active model calls.
+        // Emit authoritative fields last so an invalid engine JSON fragment
+        // cannot override the router's admission or policy epoch in the envelope.
+        let mut suffix = vec![Ok::<_, std::io::Error>(Bytes::from(format!(
+            ",\"admission\":{},\"weight_version\":{}",
+            admission.get(),
+            weight_version,
+        )))];
+        if let Some(prefill) = parts.extensions.remove::<PrefillCapture>() {
+            suffix.push(Ok(Bytes::from_static(b",\"prefill_capture\":")));
+            // Keep the original allocation alive through the upload; R3 routes
+            // can be large, so avoid copying them into an envelope string.
+            suffix.push(Ok(Bytes::from_owner(prefill)));
+        }
+        suffix.push(Ok(Bytes::from_static(b"}")));
+        let mut received = 0usize;
+        let response_stream = body.into_data_stream().map(move |chunk| {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            received = received.saturating_add(chunk.len());
+            if received > MAX_BODY_BYTES {
+                return Err(std::io::Error::other(
+                    "PD capture response exceeds body limit",
+                ));
             }
+            Ok(chunk)
+        });
+        let envelope = reqwest::Body::wrap_stream(
+            futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"{\"response\":",
+            ))])
+            .chain(response_stream)
+            .chain(futures_util::stream::iter(suffix)),
+        );
+        let completed = match self.rpc("complete", envelope).await {
+            Ok(body) => body,
             Err(error) => return error,
         };
         parts.headers.remove(header::CONTENT_LENGTH);
@@ -198,7 +267,35 @@ impl CaptureClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        Response::from_parts(parts, Body::from(completed.to_string()))
+        Response::from_parts(parts, Body::from(completed))
+    }
+}
+
+/// Inspect nested transport errors: reqwest's top-level kind can just be Request.
+fn log_socket_exhaustion(operation: &str, phase: &str, error: &(dyn std::error::Error + 'static)) {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            #[cfg(unix)]
+            let limit = match io_error.raw_os_error() {
+                Some(libc::ENOBUFS) => Some("socket_buffers"),
+                Some(libc::EMFILE) => Some("process_file_descriptors"),
+                Some(libc::ENFILE) => Some("system_file_descriptors"),
+                _ => None,
+            };
+            #[cfg(not(unix))]
+            let limit: Option<&str> = None;
+            if let Some(limit) = limit {
+                tracing::error!(
+                    %operation, %phase, %limit,
+                    os_error = io_error.raw_os_error(),
+                    detail = %io_error,
+                    "PD capture hit a local socket resource limit; check OS socket buffers/file-descriptor limits and capture-worker backlog. Connection pooling remains enabled; uploads are not concurrency-capped"
+                );
+                return;
+            }
+        }
+        cause = error.source();
     }
 }
 
@@ -276,10 +373,18 @@ mod tests {
         // scoped to this test even while awaiting HTTP responses.
         let _guard = metrics::set_default_local_recorder(&recorder);
         let delay = Duration::from_millis(30);
-        let (client, calls, server) =
-            mock_capture(StatusCode::OK, "{}", delay, Duration::from_secs(5)).await;
+        let (client, calls, server) = mock_capture(
+            StatusCode::OK,
+            r#"{"ng_commit_coords":{}}"#,
+            delay,
+            Duration::from_secs(5),
+        )
+        .await;
         for operation in ["prepare", "complete"] {
-            assert_eq!(client.rpc(operation, &json!({})).await.unwrap(), json!({}));
+            assert_eq!(
+                client.rpc(operation, "{}").await.unwrap(),
+                r#"{"ng_commit_coords":{}}"#
+            );
         }
         server.abort();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -340,11 +445,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                client
-                    .rpc(operation, &json!({}))
-                    .await
-                    .unwrap_err()
-                    .status(),
+                client.rpc(operation, "{}").await.unwrap_err().status(),
                 expected_status
             );
             server.abort();
@@ -391,7 +492,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 4096];
-            stream.read(&mut bytes).await.unwrap();
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
         });
         let client = CaptureClient::new(
             format!("http://{addr}"),
@@ -400,7 +501,7 @@ mod tests {
         )
         .unwrap();
         let failure = client
-            .rpc("complete", &json!({"secret": "private-body-marker"}))
+            .rpc("complete", r#"{"secret":"private-body-marker"}"#)
             .await
             .unwrap_err();
         assert_eq!(failure.status(), StatusCode::BAD_GATEWAY);
@@ -425,11 +526,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            client
-                .rpc("prepare", &json!({}))
-                .await
-                .unwrap_err()
-                .status(),
+            client.rpc("prepare", "{}").await.unwrap_err().status(),
             StatusCode::BAD_GATEWAY
         );
         server.abort();
@@ -440,5 +537,211 @@ mod tests {
             text.contains("is_timeout=true") && text.contains("source:"),
             "{text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_limit_diagnostic_identifies_nested_os_errors() {
+        let logs = LogWriter::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for (errno, limit) in [
+            (libc::ENOBUFS, Some("socket_buffers")),
+            (libc::EMFILE, Some("process_file_descriptors")),
+            (libc::ENFILE, Some("system_file_descriptors")),
+            (libc::ECONNRESET, None),
+        ] {
+            logs.0.lock().unwrap().clear();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = tokio::io::copy(&mut socket, &mut tokio::io::sink()).await;
+            });
+            let client =
+                CaptureClient::new(url, "private-token-marker".into(), Duration::from_secs(2))
+                    .unwrap();
+            // Inject a body-stream OS error to exercise the actual reqwest /
+            // hyper source chain without exhausting this machine's sockets.
+            let body = reqwest::Body::wrap_stream(futures_util::stream::iter([Err::<Bytes, _>(
+                std::io::Error::from_raw_os_error(errno),
+            )]));
+            assert_eq!(
+                client.rpc("complete", body).await.unwrap_err().status(),
+                StatusCode::BAD_GATEWAY
+            );
+            server.abort();
+            let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            if let Some(limit) = limit {
+                assert!(
+                    text.contains("PD capture hit a local socket resource limit"),
+                    "{text}"
+                );
+                assert!(text.contains(&format!("limit={limit}")), "{text}");
+                assert!(text.contains(&format!("os_error={errno}")), "{text}");
+                assert!(
+                    text.contains("operation=complete") && text.contains("phase=send"),
+                    "{text}"
+                );
+            } else {
+                assert!(!text.contains("local socket resource limit"), "{text}");
+            }
+            assert!(!text.contains("private-token-marker"));
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_capture_preserves_prepared_and_engine_bytes_and_waits_for_ack() {
+        use tower::ServiceExt;
+        let prefix = format!("[{}]", vec!["12345"; 100_000].join(", "));
+        let prepared = format!(r#"{{"messages":[],"required_prefix_token_ids":{prefix}}}"#);
+        let engine = r#"{"prompt_token_ids":[1, 2, 3],"choices":[{"index":0,"token_ids":[4, 5],"logprobs":{"content":[{"logprob":-0.123456789012345678901,"token":"token_id:\u0034"}]}}]}"#;
+        let prefill =
+            r#"{"prefill":{"prompt_token_ids":[1, 2, 3],"routed_experts":"opaque\u0034"}}"#;
+        let incoming = r#"{ "messages": [], "ng_capture": {"model_call_id":"raw"} }"#;
+        let completing = Arc::new(tokio::sync::Semaphore::new(0));
+        let ack = Arc::new(tokio::sync::Semaphore::new(0));
+        let completing_handler = completing.clone();
+        let ack_handler = ack.clone();
+        let prepared_handler = prepared.clone();
+        let service = Router::new()
+            .route(
+                "/prepare",
+                post(move |body: Bytes| {
+                    let prepared = prepared_handler.clone();
+                    async move {
+                        assert_eq!(body, incoming);
+                        prepared
+                    }
+                }),
+            )
+            .route(
+                "/complete",
+                post(move |body: Bytes| {
+                    let completing = completing_handler.clone();
+                    let ack = ack_handler.clone();
+                    async move {
+                        let fields: BTreeMap<String, &RawValue> =
+                            serde_json::from_slice(&body).unwrap();
+                        assert_eq!(fields["response"].get(), engine);
+                        assert_eq!(fields["prefill_capture"].get(), prefill);
+                        assert_eq!(fields["weight_version"].get(), "7");
+                        assert_eq!(fields["admission"].get(), r#"{"model_call_id":"raw"}"#);
+                        completing.add_permits(1);
+                        ack.acquire().await.unwrap().forget();
+                        r#"{"choices":[],"ng_commit_coords":{"disposition":"staged"}}"#
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        let capture =
+            Arc::new(CaptureClient::new(url, "test".into(), Duration::from_secs(5)).unwrap());
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |request: Request| {
+                    let prepared = prepared.clone();
+                    async move {
+                        assert!(request.extensions().get::<ManagedCapture>().is_some());
+                        assert_eq!(
+                            to_bytes(request.into_body(), MAX_BODY_BYTES).await.unwrap(),
+                            prepared
+                        );
+                        // Exercise chunked forwarding, including a split inside a JSON string.
+                        let mut response =
+                            Response::new(Body::from_stream(futures_util::stream::iter([
+                                Ok::<_, Infallible>(&engine[..100]),
+                                Ok(&engine[100..]),
+                            ])));
+                        response.extensions_mut().insert(PrefillCapture(Arc::from(
+                            RawValue::from_string(prefill.into()).unwrap(),
+                        )));
+                        response
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let capture = capture.clone();
+                    async move { capture.run(request, next, 7).await }
+                },
+            ));
+        let task = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(incoming))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(5), completing.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(
+            !task.is_finished(),
+            "response must wait for staging acknowledgement"
+        );
+        ack.add_permits(1);
+        let response = task.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+            r#"{"choices":[],"ng_commit_coords":{"disposition":"staged"}}"#
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn completion_uploads_have_no_worker_count_concurrency_cap() {
+        const CALLS: u32 = 64;
+        let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let seen = arrived.clone();
+        let gate = release.clone();
+        let service = Router::new().route(
+            "/complete",
+            post(move || {
+                let seen = seen.clone();
+                let gate = gate.clone();
+                async move {
+                    seen.add_permits(1);
+                    gate.acquire().await.unwrap().forget();
+                    r#"{"ng_commit_coords":{"disposition":"staged"}}"#
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        let capture =
+            Arc::new(CaptureClient::new(url, "test".into(), Duration::from_secs(10)).unwrap());
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..CALLS {
+            let capture = capture.clone();
+            calls.spawn(async move { capture.rpc("complete", "{}").await });
+        }
+        tokio::time::timeout(Duration::from_secs(5), arrived.acquire_many(CALLS))
+            .await
+            .expect("all uploads must reach the service before any acknowledgement")
+            .unwrap()
+            .forget();
+        release.add_permits(CALLS as usize);
+        while let Some(result) = calls.join_next().await {
+            assert!(result.unwrap().is_ok());
+        }
+        server.abort();
     }
 }

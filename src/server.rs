@@ -247,12 +247,33 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    req: Request,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-
+    if req
+        .extensions()
+        .get::<crate::pd_capture_rpc::ManagedCapture>()
+        .is_some()
+    {
+        let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Cannot read chat: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        return state.router.route_managed_chat(Some(&headers), bytes).await;
+    }
+    use axum::extract::FromRequest;
+    let Json(body) = match Json::<ChatCompletionRequest>::from_request(req, &state).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     state.router.route_chat(Some(&headers), &body, None).await
 }
 

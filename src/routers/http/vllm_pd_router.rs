@@ -3,6 +3,7 @@
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_capture;
+use super::pd_raw::{self, PdRequest};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -469,7 +470,8 @@ impl VllmPDRouter {
     /// - For other OpenAI endpoints (chat/completions): patch max_tokens, max_completion_tokens, min_tokens
     ///
     /// stream=false and stream_options removal are always applied at top level.
-    fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
+    fn prepare_prefill_request(request: impl Into<PdRequest>, path: &str) -> PdRequest {
+        let mut request = request.into();
         if path.contains("inference/v1/generate") {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
@@ -557,10 +559,11 @@ impl VllmPDRouter {
     /// Process vLLM request using pure service discovery
     async fn process_vllm_request(
         &self,
-        request_json: Value,
+        request_json: impl Into<PdRequest>,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
+        let request_json = request_json.into();
         debug!("Processing vLLM request for path: {}", path);
         debug!(
             "Request JSON: {}",
@@ -636,6 +639,8 @@ impl VllmPDRouter {
             decode_policy_name
         );
 
+        // The policy's serialized lookup key is no longer needed during inference.
+        drop(request_text);
         // Process two-stage vLLM request with discovered endpoints
         match self
             .process_vllm_two_stage_request_discovered(
@@ -677,6 +682,8 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
+        managed: bool,
+        raw_capture_metadata: Option<Box<serde_json::value::RawValue>>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -694,6 +701,10 @@ impl VllmPDRouter {
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
+        }
+
+        if managed {
+            return pd_raw::decode_response(decode_response, raw_capture_metadata);
         }
 
         if (needs_logprobs
@@ -795,17 +806,16 @@ impl VllmPDRouter {
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
     async fn process_vllm_two_stage_request_discovered(
         &self,
-        request_json: Value,
+        request_json: impl Into<PdRequest>,
         prefill_instance: &(String, String),
         decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, String> {
-        if let Err(reason) = pd_capture::validate(
-            &request_json,
-            path,
-            matches!(self.kv_connector, KvConnector::Nixl),
-        ) {
+        let request_json = request_json.into();
+        if let Err(reason) =
+            request_json.validate_capture(path, matches!(self.kv_connector, KvConnector::Nixl))
+        {
             return Ok((StatusCode::BAD_REQUEST, reason).into_response());
         }
 
@@ -871,7 +881,7 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let prefill_request_str = serde_json::to_string(&prefill_request)
+        let mut prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
 
         let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
@@ -879,6 +889,7 @@ impl VllmPDRouter {
         // Stage 1: dispatch prefill.
         // Sequential mode: send now and await — decode kv_transfer_params come from the prefill response.
         // Concurrent mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
+        let mut raw_capture_metadata = None;
         let prefill_response_json: Option<Value> = if is_concurrent_dispatch {
             None
         } else {
@@ -896,7 +907,7 @@ impl VllmPDRouter {
                     &request_id,
                     prefill_dp_rank,
                 )
-                .body(prefill_request_str.clone()),
+                .body(std::mem::take(&mut prefill_request_str)),
                 headers,
                 ClientRequestOptions {
                     method: "POST",
@@ -947,14 +958,14 @@ impl VllmPDRouter {
 
             debug!("Prefill response body: {}", prefill_response_text);
 
-            let mut prefill_json: Value = serde_json::from_str(&prefill_response_text)
-                .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
+            let (prefill_json, metadata) =
+                request_json.prefill(prefill_response_text.as_bytes())?;
+            raw_capture_metadata = metadata;
 
             // Stop profiling on prefill server once we have its response.
             self.stop_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
-            pd_capture::attach_prefill(&request_json, &mut prefill_json)?;
             Some(prefill_json)
         };
 
@@ -1145,6 +1156,8 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
+                    request_json.managed,
+                    raw_capture_metadata,
                 )
                 .await;
         }
@@ -1186,6 +1199,8 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            request_json.managed,
+            raw_capture_metadata,
         )
         .await
     }
@@ -1201,17 +1216,16 @@ impl VllmPDRouter {
     /// waiting for the prefill request to finish.
     async fn process_vllm_two_stage_request(
         &self,
-        original_request: Value,
+        original_request: impl Into<PdRequest>,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
-        if let Err(reason) = pd_capture::validate(
-            &original_request,
-            path,
-            matches!(self.kv_connector, KvConnector::Nixl),
-        ) {
+        let original_request = original_request.into();
+        if let Err(reason) =
+            original_request.validate_capture(path, matches!(self.kv_connector, KvConnector::Nixl))
+        {
             return Ok((StatusCode::BAD_REQUEST, reason).into_response());
         }
 
@@ -1375,22 +1389,21 @@ impl VllmPDRouter {
         }
 
         // Parse prefill response to extract kv_transfer_params
-        let mut prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
-            Ok(json) => json,
-            Err(e) => {
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Failed to parse prefill response as JSON: {}", e),
-                });
-            }
-        };
+        let (prefill_response_json, raw_capture_metadata) =
+            match original_request.prefill(&prefill_bytes) {
+                Ok(json) => json,
+                Err(e) => {
+                    let duration = start_time.elapsed();
+                    RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                    RouterMetrics::record_pd_request(path);
+                    RouterMetrics::record_pd_request_duration(path, duration);
+                    return Err(PDRouterError::NetworkError {
+                        message: format!("Failed to parse prefill response as JSON: {}", e),
+                    });
+                }
+            };
 
-        pd_capture::attach_prefill(&original_request, &mut prefill_response_json)
-            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
-
+        drop(prefill_bytes);
         // Extract kv_transfer_params from prefill response if present
         let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
 
@@ -1556,6 +1569,11 @@ impl VllmPDRouter {
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        if original_request.managed {
+            return pd_raw::decode_response(decode_response, raw_capture_metadata)
+                .map_err(|message| PDRouterError::NetworkError { message });
+        }
 
         // If logprobs requested and non-streaming, merge prefill and decode logprobs
         if (needs_logprobs || pd_capture::metadata(&prefill_response_json).is_some())
@@ -2339,7 +2357,40 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         path: &str,
         method: &Method,
-        body: serde_json::Value,
+        body: Value,
+    ) -> Response {
+        self.route_pd_request(headers, path, method, body.into())
+            .await
+    }
+
+    async fn route_managed_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+    ) -> Response {
+        let request = match PdRequest::managed(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid prepared chat: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        drop(body);
+        self.route_pd_request(headers, "/v1/chat/completions", &Method::POST, request)
+            .await
+    }
+}
+
+impl VllmPDRouter {
+    async fn route_pd_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: PdRequest,
     ) -> Response {
         // Only handle POST requests for inference
         if *method != Method::POST {
@@ -2355,7 +2406,6 @@ impl RouterTrait for VllmPDRouter {
             method, path
         );
 
-        // Body is already a serde_json::Value, use it directly
         let request_json = body;
 
         if self.use_discovery {
@@ -2447,6 +2497,7 @@ impl RouterTrait for VllmPDRouter {
                 decode_worker.url()
             );
 
+            drop(request_text);
             // Execute two-stage processing
             match self
                 .process_vllm_two_stage_request(
@@ -3093,7 +3144,12 @@ mod tests {
         use axum::routing::post;
         use tokio::net::TcpListener;
         for discovered in [false, true] {
-            for streaming in [false, true] {
+            for (streaming, managed, r3) in [
+                (false, false, true),
+                (true, false, true),
+                (false, true, true),
+                (false, true, false),
+            ] {
                 let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let prefill_address = prefill_listener.local_addr().unwrap();
                 let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3117,7 +3173,7 @@ mod tests {
                     let response = decode_json.clone();
                     async move {
                         assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
-                        assert_eq!(body["routed_experts_prompt_start"], 2);
+                        if r3 { assert_eq!(body["routed_experts_prompt_start"], 2); }
                         assert_eq!(body["return_token_ids"], true);
                         assert_eq!(body["max_tokens"], 8);
                         assert_eq!(body["kv_transfer_params"]["remote_num_tokens"], 2);
@@ -3140,14 +3196,19 @@ mod tests {
                 let typed: crate::protocols::spec::ChatCompletionRequest =
                     serde_json::from_value(json!({
                         "messages": [{"role": "user", "content": "hi"}], "model": "test",
-                        "required_prefix_token_ids": [11, 12], "nemo_rl_pd_capture": true,
-                        "return_token_ids": false, "max_tokens": 8, "stream": streaming,
+                        "required_prefix_token_ids": [11, 12], "nemo_rl_pd_capture": r3,
+                        "return_token_ids": true, "max_tokens": 8, "stream": streaming,
                         "logprobs": false
                     }))
                     .unwrap();
                 let mut request = serde_json::to_value(typed).unwrap();
                 // Regression: capture metadata must survive without any logprobs field.
                 request.as_object_mut().unwrap().remove("logprobs");
+                let request = if managed {
+                    PdRequest::managed(&serde_json::to_vec(&request).unwrap()).unwrap()
+                } else {
+                    request.into()
+                };
                 let response = if discovered {
                     router
                         .process_vllm_two_stage_request_discovered(
@@ -3179,6 +3240,10 @@ mod tests {
                         .await
                         .unwrap()
                 };
+                let raw_prefill = response
+                    .extensions()
+                    .get::<crate::pd_capture_rpc::PrefillCapture>()
+                    .map(|metadata| serde_json::from_str::<Value>(metadata.0.get()).unwrap());
                 let status = response.status();
                 let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -3196,11 +3261,19 @@ mod tests {
                     serde_json::from_slice(&body).unwrap()
                 };
                 assert_eq!(payload["choices"], expected_choices);
-                assert_eq!(payload["nemo_rl_pd_capture"]["decode_route_start"], 2);
-                assert_eq!(
-                    payload["nemo_rl_pd_capture"]["prefill"]["routed_experts"],
-                    "prefill-routes"
-                );
+                if r3 {
+                    let metadata = if managed {
+                        assert!(payload.get("nemo_rl_pd_capture").is_none());
+                        raw_prefill.as_ref().unwrap()
+                    } else {
+                        &payload["nemo_rl_pd_capture"]
+                    };
+                    assert_eq!(metadata["decode_route_start"], 2);
+                    assert_eq!(metadata["prefill"]["routed_experts"], "prefill-routes");
+                } else {
+                    assert!(payload.get("nemo_rl_pd_capture").is_none());
+                    assert!(raw_prefill.is_none());
+                }
                 prefill_server.abort();
                 decode_server.abort();
             }
