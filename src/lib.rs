@@ -10,7 +10,6 @@ pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod pd_admission;
-pub mod pd_capture_rpc;
 pub mod policies;
 pub mod protocols;
 pub mod routers;

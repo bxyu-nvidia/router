@@ -683,7 +683,6 @@ impl VllmPDRouter {
         is_streaming: bool,
         needs_logprobs: bool,
         managed: bool,
-        raw_capture_metadata: Option<Box<serde_json::value::RawValue>>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -704,16 +703,10 @@ impl VllmPDRouter {
         }
 
         if managed {
-            return pd_raw::decode_response(decode_response, raw_capture_metadata);
+            return pd_raw::decode_response(decode_response);
         }
 
-        if (needs_logprobs
-            || prefill_response_json
-                .and_then(pd_capture::metadata)
-                .is_some())
-            && !is_streaming
-            && decode_response.status().is_success()
-        {
+        if needs_logprobs && !is_streaming && decode_response.status().is_success() {
             debug!("Merging prefill metadata into non-streaming decode response");
 
             let status = decode_response.status();
@@ -728,15 +721,10 @@ impl VllmPDRouter {
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            pd_capture::merge(prefill_json_ref, &mut decode_json)?;
-            if pd_capture::metadata(prefill_json_ref).is_none() {
-                if logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json) {
-                    debug!("Successfully merged logprobs from prefill and decode responses");
-                } else {
-                    warn!(
-                        "No logprobs were merged (might be expected if logprobs not in response)"
-                    );
-                }
+            if logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json) {
+                debug!("Successfully merged logprobs from prefill and decode responses");
+            } else {
+                warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
             let merged_body = serde_json::to_vec(&decode_json)
@@ -768,18 +756,7 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = if status.is_success() {
-                if let Some(metadata) = prefill_response_json.and_then(pd_capture::metadata) {
-                    Body::from_stream(pd_capture::stream(
-                        decode_response.bytes_stream(),
-                        metadata.clone(),
-                    ))
-                } else {
-                    Body::from_stream(decode_response.bytes_stream())
-                }
-            } else {
-                Body::from_stream(decode_response.bytes_stream())
-            };
+            let body = Body::from_stream(decode_response.bytes_stream());
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -889,7 +866,6 @@ impl VllmPDRouter {
         // Stage 1: dispatch prefill.
         // Sequential mode: send now and await — decode kv_transfer_params come from the prefill response.
         // Concurrent mode: skip; prefill is sent concurrently with decode in Stage 2 via tokio::join!.
-        let mut raw_capture_metadata = None;
         let prefill_response_json: Option<Value> = if is_concurrent_dispatch {
             None
         } else {
@@ -958,9 +934,7 @@ impl VllmPDRouter {
 
             debug!("Prefill response body: {}", prefill_response_text);
 
-            let (prefill_json, metadata) =
-                request_json.prefill(prefill_response_text.as_bytes())?;
-            raw_capture_metadata = metadata;
+            let prefill_json = request_json.prefill(prefill_response_text.as_bytes())?;
 
             // Stop profiling on prefill server once we have its response.
             self.stop_profiling(&format!("http://{}", prefill_base_http))
@@ -1157,7 +1131,6 @@ impl VllmPDRouter {
                     is_streaming,
                     needs_logprobs,
                     request_json.managed,
-                    raw_capture_metadata,
                 )
                 .await;
         }
@@ -1200,7 +1173,6 @@ impl VllmPDRouter {
             is_streaming,
             needs_logprobs,
             request_json.managed,
-            raw_capture_metadata,
         )
         .await
     }
@@ -1389,19 +1361,18 @@ impl VllmPDRouter {
         }
 
         // Parse prefill response to extract kv_transfer_params
-        let (prefill_response_json, raw_capture_metadata) =
-            match original_request.prefill(&prefill_bytes) {
-                Ok(json) => json,
-                Err(e) => {
-                    let duration = start_time.elapsed();
-                    RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                    RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, duration);
-                    return Err(PDRouterError::NetworkError {
-                        message: format!("Failed to parse prefill response as JSON: {}", e),
-                    });
-                }
-            };
+        let prefill_response_json = match original_request.prefill(&prefill_bytes) {
+            Ok(json) => json,
+            Err(e) => {
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                return Err(PDRouterError::NetworkError {
+                    message: format!("Failed to parse prefill response as JSON: {}", e),
+                });
+            }
+        };
 
         drop(prefill_bytes);
         // Extract kv_transfer_params from prefill response if present
@@ -1571,15 +1542,12 @@ impl VllmPDRouter {
             .unwrap_or(false);
 
         if original_request.managed {
-            return pd_raw::decode_response(decode_response, raw_capture_metadata)
+            return pd_raw::decode_response(decode_response)
                 .map_err(|message| PDRouterError::NetworkError { message });
         }
 
         // If logprobs requested and non-streaming, merge prefill and decode logprobs
-        if (needs_logprobs || pd_capture::metadata(&prefill_response_json).is_some())
-            && !is_streaming
-            && status.is_success()
-        {
+        if needs_logprobs && !is_streaming && status.is_success() {
             debug!("Merging prefill metadata into non-streaming decode response");
 
             // Read decode response body
@@ -1600,18 +1568,11 @@ impl VllmPDRouter {
                     message: format!("Failed to parse decode response as JSON: {}", e),
                 })?;
 
-            pd_capture::merge(&prefill_response_json, &mut decode_json)
-                .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
             // Merge logprobs from prefill into decode response
-            if pd_capture::metadata(&prefill_response_json).is_none() {
-                if logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json)
-                {
-                    debug!("Successfully merged logprobs from prefill and decode responses");
-                } else {
-                    warn!(
-                        "No logprobs were merged (might be expected if logprobs not in response)"
-                    );
-                }
+            if logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json) {
+                debug!("Successfully merged logprobs from prefill and decode responses");
+            } else {
+                warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
             // Serialize merged response
@@ -1646,18 +1607,7 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if is_streaming && status.is_success() {
-                if let Some(metadata) = pd_capture::metadata(&prefill_response_json) {
-                    Body::from_stream(pd_capture::stream(
-                        decode_response.bytes_stream(),
-                        metadata.clone(),
-                    ))
-                } else {
-                    Body::from_stream(decode_response.bytes_stream())
-                }
-            } else {
-                Body::from_stream(decode_response.bytes_stream())
-            };
+            let body = Body::from_stream(decode_response.bytes_stream());
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -3140,50 +3090,53 @@ mod tests {
     }
     /// Exercise the real HTTP dispatch and response paths in both routing modes.
     #[tokio::test]
-    async fn pd_chat_capture_http_preserves_alignment_and_decode_outputs() {
+    async fn pd_chat_capture_http_forwards_engine_references_and_receipts() {
         use axum::routing::post;
+        use axum::Json;
         use tokio::net::TcpListener;
         for discovered in [false, true] {
-            for (streaming, managed, r3) in [
-                (false, false, true),
-                (true, false, true),
-                (false, true, true),
-                (false, true, false),
-            ] {
+            for managed in [false, true] {
                 let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let prefill_address = prefill_listener.local_addr().unwrap();
                 let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let decode_address = decode_listener.local_addr().unwrap();
-                let prefill_app = axum::Router::new().route("/v1/chat/completions", post(|Json(body): Json<Value>| async move {
-                    assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
-                    assert_eq!(body["return_token_ids"], true);
+                let prefill_app = axum::Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| async move {
                     assert_eq!(body["stream"], false);
                     assert_eq!(body["max_tokens"], 1);
-                    assert!(body.get("nemo_rl_pd_capture").is_none());
-                    Json(json!({"prompt_token_ids": [11, 12, 13],
-                        "kv_transfer_params": {"remote_num_tokens": 2},
-                        "choices": [{"index": 0, "token_ids": [999], "routed_experts": "prefill-routes"}]}))
-                }));
-                let decode_json = json!({"prompt_token_ids": [11, 12, 13],
-                    "choices": [{"index": 0, "message": {"content": "hello"}, "token_ids": [14],
-                        "logprobs": {"content": [{"token": "token_id:14", "logprob": -0.1}]},
-                        "routed_experts": "decode-routes", "finish_reason": "stop"}]});
-                let expected_choices = decode_json["choices"].clone();
-                let decode_app = axum::Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
-                    let response = decode_json.clone();
-                    async move {
+                    if managed {
+                        assert_eq!(body["nemo_rl_capture"]["phase"], "prefill");
+                        assert!(body.get("required_prefix_token_ids").is_none());
+                    } else {
                         assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
-                        if r3 { assert_eq!(body["routed_experts_prompt_start"], 2); }
-                        assert_eq!(body["return_token_ids"], true);
-                        assert_eq!(body["max_tokens"], 8);
-                        assert_eq!(body["kv_transfer_params"]["remote_num_tokens"], 2);
-                        assert!(body.get("nemo_rl_pd_capture").is_none());
-                        if streaming {
-                            let raw = format!("data: {{\"prompt_token_ids\":[11,12,13],\"choices\":[]}}\n\ndata: {}\n\ndata: [DONE]\n\n", response);
-                            ([("content-type", "text/event-stream")], raw).into_response()
-                        } else { Json(response).into_response() }
                     }
+                    Json(json!({"kv_transfer_params":{"remote_num_tokens":2,"nemo_rl_prefill_key":"stored-prefill"}, "choices":[]}))
                 }));
+                let mut expected = json!({"choices":[{"index":0,"message":{"content":"hello"},"finish_reason":"stop"}]});
+                if managed {
+                    expected["ng_commit_coords"] =
+                        json!({"disposition":"staged","staging_key":"stored-decode"});
+                }
+                let response_json = expected.clone();
+                let decode_app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    post(move |Json(body): Json<Value>| {
+                        let response = response_json.clone();
+                        async move {
+                            assert_eq!(body["max_tokens"], 8);
+                            assert_eq!(body["kv_transfer_params"]["remote_num_tokens"], 2);
+                            if managed {
+                                assert_eq!(body["nemo_rl_capture"]["phase"], "decode");
+                                assert_eq!(
+                                    body["nemo_rl_capture"]["prefill_key"],
+                                    "stored-prefill"
+                                );
+                            } else {
+                                assert_eq!(body["required_prefix_token_ids"], json!([11, 12]));
+                            }
+                            Json(response)
+                        }
+                    }),
+                );
                 let prefill_server = tokio::spawn(async move {
                     axum::serve(prefill_listener, prefill_app).await.unwrap()
                 });
@@ -3192,22 +3145,13 @@ mod tests {
                         async move { axum::serve(decode_listener, decode_app).await.unwrap() },
                     );
                 let router = test_vllm_pd_router();
-                // Roundtrip the public request type to catch lost extension fields.
-                let typed: crate::protocols::spec::ChatCompletionRequest =
-                    serde_json::from_value(json!({
-                        "messages": [{"role": "user", "content": "hi"}], "model": "test",
-                        "required_prefix_token_ids": [11, 12], "nemo_rl_pd_capture": r3,
-                        "return_token_ids": true, "max_tokens": 8, "stream": streaming,
-                        "logprobs": false
-                    }))
-                    .unwrap();
-                let mut request = serde_json::to_value(typed).unwrap();
-                // Regression: capture metadata must survive without any logprobs field.
-                request.as_object_mut().unwrap().remove("logprobs");
+                let mut body = json!({"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":8});
                 let request = if managed {
-                    PdRequest::managed(&serde_json::to_vec(&request).unwrap()).unwrap()
+                    body["nemo_rl_capture"] = json!({"phase":"decode"});
+                    PdRequest::managed(&serde_json::to_vec(&body).unwrap()).unwrap()
                 } else {
-                    request.into()
+                    body["required_prefix_token_ids"] = json!([11, 12]);
+                    body.into()
                 };
                 let response = if discovered {
                     router
@@ -3240,40 +3184,11 @@ mod tests {
                         .await
                         .unwrap()
                 };
-                let raw_prefill = response
-                    .extensions()
-                    .get::<crate::pd_capture_rpc::PrefillCapture>()
-                    .map(|metadata| serde_json::from_str::<Value>(metadata.0.get()).unwrap());
-                let status = response.status();
-                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap();
-                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-                let payload: Value = if streaming {
-                    std::str::from_utf8(&body)
-                        .unwrap()
-                        .split("\n\n")
-                        .filter_map(|f| f.strip_prefix("data: "))
-                        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
-                        .find(|f| f.get("nemo_rl_pd_capture").is_some())
-                        .unwrap()
-                } else {
-                    serde_json::from_slice(&body).unwrap()
-                };
-                assert_eq!(payload["choices"], expected_choices);
-                if r3 {
-                    let metadata = if managed {
-                        assert!(payload.get("nemo_rl_pd_capture").is_none());
-                        raw_prefill.as_ref().unwrap()
-                    } else {
-                        &payload["nemo_rl_pd_capture"]
-                    };
-                    assert_eq!(metadata["decode_route_start"], 2);
-                    assert_eq!(metadata["prefill"]["routed_experts"], "prefill-routes");
-                } else {
-                    assert!(payload.get("nemo_rl_pd_capture").is_none());
-                    assert!(raw_prefill.is_none());
-                }
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
                 prefill_server.abort();
                 decode_server.abort();
             }

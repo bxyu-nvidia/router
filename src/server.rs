@@ -254,7 +254,7 @@ async fn v1_chat_completions(
     }
     if req
         .extensions()
-        .get::<crate::pd_capture_rpc::ManagedCapture>()
+        .get::<crate::pd_admission::ManagedCapture>()
         .is_some()
     {
         let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
@@ -909,26 +909,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         if !config.router_config.mode.is_pd_mode() {
             return Err("Managed RL admission requires a PD router".into());
         }
-        let capture = std::env::var("NEMO_RL_PD_CAPTURE_URL")
-            .ok()
-            .filter(|url| !url.is_empty())
-            .map(|url| {
-                let timeout = std::env::var("NEMO_RL_PD_CAPTURE_TIMEOUT_SECONDS")
-                    .map_err(|_| {
-                        "PD capture requires NEMO_RL_PD_CAPTURE_TIMEOUT_SECONDS".to_string()
-                    })?
-                    .parse::<u64>()
-                    .map_err(|e| e.to_string())?;
-                crate::pd_capture_rpc::CaptureClient::new(
-                    url,
-                    token.clone(),
-                    std::time::Duration::from_secs(timeout),
-                )
-            })
-            .transpose()?;
-        app_context.pd_admission = Some(crate::pd_admission::PDAdmission::with_capture(
-            token, capture,
-        )?);
+        app_context.pd_admission = Some(crate::pd_admission::PDAdmission::new(token)?);
     }
     println!("DEBUG: AppContext created");
 
