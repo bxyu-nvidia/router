@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
+pub mod pd_admission;
 pub mod policies;
 pub mod protocols;
 pub mod routers;

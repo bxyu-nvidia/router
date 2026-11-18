@@ -87,6 +87,23 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route a chat body prepared by the authenticated capture service.
+    /// Routers may override this to preserve large fields as raw JSON.
+    async fn route_managed_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+    ) -> Response {
+        match serde_json::from_slice::<ChatCompletionRequest>(&body) {
+            Ok(request) => self.route_chat(headers, &request, None).await,
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chat JSON: {error}"),
+            )
+                .into_response(),
+        }
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,
