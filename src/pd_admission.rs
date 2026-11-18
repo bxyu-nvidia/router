@@ -35,6 +35,7 @@ struct AdmissionState {
 pub struct PDAdmission {
     token: String,
     capture: Option<crate::pd_capture_rpc::CaptureClient>,
+    engine_capture: Mutex<Option<(u32, bool)>>,
     state: Mutex<AdmissionState>,
     changed: Notify,
 }
@@ -54,6 +55,7 @@ impl PDAdmission {
         Ok(Arc::new(Self {
             token,
             capture,
+            engine_capture: Mutex::new(None),
             state: Mutex::new(AdmissionState {
                 paused: false,
                 active: 0,
@@ -158,8 +160,14 @@ impl Drop for Admission {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlRequest {
     Status,
+    ConfigureCapture {
+        top_logprobs: u32,
+        routed_experts: bool,
+    },
     Pause,
-    SetVersion { weight_version: u64 },
+    SetVersion {
+        weight_version: u64,
+    },
     Resume,
 }
 
@@ -186,12 +194,28 @@ async fn control(
     }
     let result = match request {
         ControlRequest::Status => Ok(()),
+        ControlRequest::ConfigureCapture {
+            top_logprobs,
+            routed_experts,
+        } => {
+            let state = gate.state.lock();
+            if !state.paused
+                || state.active != 0
+                || gate.capture.is_some()
+                || state.failure.is_some()
+            {
+                Err("Pause and drain before configuring engine capture".into())
+            } else {
+                *gate.engine_capture.lock() = Some((top_logprobs, routed_experts));
+                Ok(())
+            }
+        }
         ControlRequest::Pause => gate.pause().await,
         ControlRequest::SetVersion { weight_version } => gate.set_version(weight_version),
         ControlRequest::Resume => gate.resume(),
     };
     match result {
-        Ok(()) => Json(json!({"ok": true, "version": 1, "capture_protocol": gate.capture.as_ref().map(|_| 1), "state": gate.state.lock().clone()}))
+        Ok(()) => Json(json!({"ok": true, "version": 1, "capture_protocol": if gate.engine_capture.lock().is_some() { Some(2) } else { gate.capture.as_ref().map(|_| 1) }, "state": gate.state.lock().clone()}))
             .into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
     }
@@ -235,7 +259,17 @@ pub async fn middleware(
     // when the response or its stream receiver has already been dropped.
     let (headers_tx, headers_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let response = if let Some(capture) = &admission.gate.capture {
+        let engine_capture = *admission.gate.engine_capture.lock();
+        let response = if let Some((top_logprobs, routed_experts)) = engine_capture {
+            run_engine_capture(
+                request,
+                next,
+                admission.weight_version,
+                top_logprobs,
+                routed_experts,
+            )
+            .await
+        } else if let Some(capture) = &admission.gate.capture {
             capture.run(request, next, admission.weight_version).await
         } else {
             next.run(request).await
@@ -268,6 +302,98 @@ pub async fn middleware(
     headers_rx
         .await
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Stamp only small coordination fields. Token arrays never enter this service.
+async fn run_engine_capture(
+    request: Request,
+    next: Next,
+    version: u64,
+    top_logprobs: u32,
+    routed_experts: bool,
+) -> Response {
+    use serde_json::{value::RawValue, Value};
+    use std::collections::BTreeMap;
+    if request.uri().path() != "/v1/chat/completions" {
+        return next.run(request).await;
+    }
+    let (mut parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 512 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let mut fields: BTreeMap<String, Box<RawValue>> = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let Some(admission) = fields
+        .remove("ng_capture")
+        .filter(|value| value.get() != "null")
+    else {
+        if fields.contains_key("nemo_rl_capture") {
+            return (
+                StatusCode::BAD_REQUEST,
+                "nemo_rl_capture is owned by managed admission",
+            )
+                .into_response();
+        }
+        return next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
+    };
+    // These fields are owned by admission, not by a caller or earlier retry.
+    for key in [
+        "nemo_rl_capture",
+        "nemo_rl_pd_capture",
+        "required_prefix_token_ids",
+        "routed_experts_prompt_start",
+    ] {
+        fields.remove(key);
+    }
+    for (key, expected) in [
+        ("stream", json!(false)),
+        ("n", json!(1)),
+        ("best_of", json!(1)),
+    ] {
+        if let Some(value) = fields.get(key) {
+            if serde_json::from_str::<Value>(value.get())
+                .ok()
+                .is_some_and(|value| !value.is_null() && value != expected)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Engine capture requires stream=false, n=1, best_of=1",
+                )
+                    .into_response();
+            }
+        }
+    }
+    let mut admission: Value = match serde_json::from_str(admission.get()) {
+        Ok(Value::Object(value)) => Value::Object(value),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if admission.get("prev_len").is_none() {
+        admission["prev_len"] = json!(0);
+    }
+    let context = json!({"version": 1, "engine_capture": true, "admission": admission,
+        "weight_version": version, "phase": "decode", "top_logprobs": top_logprobs, "routed_experts": routed_experts});
+    fields.insert(
+        "nemo_rl_capture".into(),
+        serde_json::value::to_raw_value(&context).unwrap(),
+    );
+    fields.remove("top_logprobs");
+    for key in ["logprobs", "return_token_ids"] {
+        fields.insert(key.into(), serde_json::value::to_raw_value(&false).unwrap());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts
+        .extensions
+        .insert(crate::pd_capture_rpc::ManagedCapture);
+    next.run(Request::from_parts(
+        parts,
+        Body::from(serde_json::to_vec(&fields).unwrap()),
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -318,6 +444,100 @@ mod tests {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_capture_preserves_requests_without_capture_admission() {
+        let gate = gate();
+        *gate.engine_capture.lock() = Some((8, true));
+        let downstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|request: Request| async move {
+                assert!(request
+                    .extensions()
+                    .get::<crate::pd_capture_rpc::ManagedCapture>()
+                    .is_none());
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["required_prefix_token_ids"], json!([1, 2]));
+                assert_eq!(body["logprobs"], true);
+                assert!(body.get("nemo_rl_capture").is_none());
+                StatusCode::OK
+            }),
+        );
+        let app = app(Some(gate), downstream);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from(
+                r#"{"messages":[],"required_prefix_token_ids":[1,2],"logprobs":true}"#,
+            ))
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn engine_capture_stamps_epoch_without_http_capture_service() {
+        let gate = gate();
+        let downstream = Router::new().route("/v1/chat/completions", post(|request: Request| async move {
+            assert!(request.extensions().get::<crate::pd_capture_rpc::ManagedCapture>().is_some());
+            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body.get("ng_capture").is_none());
+            assert!(body.get("required_prefix_token_ids").is_none());
+            assert_eq!(body["messages"][0]["content"], "hello");
+            assert_eq!(body["nemo_rl_capture"], json!({"version":1, "engine_capture":true,
+                "admission":{"model_call_id":"c1","prev_len":0}, "weight_version":7,
+                "phase":"decode", "top_logprobs":8, "routed_experts":true}));
+            Json(json!({"choices":[{"message":{"content":"ok"}}],"ng_commit_coords":{"disposition":"staged"}}))
+        }));
+        let app = app(Some(gate), downstream);
+        assert_eq!(
+            command(
+                &app,
+                json!({"operation":"configure_capture", "top_logprobs":8,"routed_experts":true})
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            command(&app, json!({"operation":"pause"})).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            command(
+                &app,
+                json!({"operation":"configure_capture", "top_logprobs":8,"routed_experts":true})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            command(&app, json!({"operation":"set_version", "weight_version":7}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            command(&app, json!({"operation":"resume"})).await.status(),
+            StatusCode::OK
+        );
+        let response = app
+            .oneshot(captured_request(
+                json!({"nemo_rl_capture":{"weight_version":999},"required_prefix_token_ids":[99]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ng_commit_coords"]["disposition"], "staged");
     }
 
     #[tokio::test]

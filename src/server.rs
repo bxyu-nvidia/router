@@ -911,6 +911,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         let capture = std::env::var("NEMO_RL_PD_CAPTURE_URL")
             .ok()
+            .filter(|url| !url.is_empty())
             .map(|url| {
                 let timeout = std::env::var("NEMO_RL_PD_CAPTURE_TIMEOUT_SECONDS")
                     .map_err(|_| {

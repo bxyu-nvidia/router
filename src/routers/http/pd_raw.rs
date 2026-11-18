@@ -122,6 +122,14 @@ impl PdRequest {
         {
             return Err("PD capture requires sequential NIXL dispatch".into());
         }
+        if self
+            .pointer("/nemo_rl_capture/engine_capture")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && !sequential_nixl
+        {
+            return Err("Engine capture requires sequential NIXL dispatch".into());
+        }
         // /prepare validates messages, n, best_of and the ledger prefix. The
         // engine renders the chat; /complete validates exact token alignment.
         Ok(())
@@ -249,6 +257,24 @@ pub(crate) fn decode_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_capture_passes_only_prefill_key_to_decode() {
+        let request =
+            PdRequest::managed(br#"{"messages":[],"nemo_rl_capture":{"engine_capture":true}}"#)
+                .unwrap();
+        assert!(request
+            .validate_capture("/v1/chat/completions", false)
+            .is_err());
+        let (prefill, arrays) = request.prefill(br#"{"choices":[{"message":{"content":"ignored"}}],"kv_transfer_params":{"remote_num_tokens":4,"nemo_rl_prefill_key":"opaque"}}"#).unwrap();
+        assert!(arrays.is_none());
+        let mut decode = request;
+        super::super::pd_capture::prepare_decode(&mut decode, &prefill).unwrap();
+        assert_eq!(decode["nemo_rl_capture"]["prefill_key"], "opaque");
+        assert_eq!(decode["nemo_rl_capture"]["phase"], "decode");
+        assert!(decode.get("nemo_rl_pd_capture").is_none());
+        assert!(super::super::pd_capture::prepare_decode(&mut decode, &json!({})).is_err());
+    }
 
     #[test]
     fn managed_request_shares_opaque_arrays_and_preserves_wire_values() {

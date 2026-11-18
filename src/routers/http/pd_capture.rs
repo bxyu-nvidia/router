@@ -119,6 +119,14 @@ pub fn prepare_decode(request: &mut Value, prefill: &Value) -> Result<(), String
         .and_then(Value::as_object_mut)
     {
         context.insert("phase".into(), json!("decode"));
+        if context.get("engine_capture").and_then(Value::as_bool) == Some(true) {
+            let key = prefill
+                .pointer("/kv_transfer_params/nemo_rl_prefill_key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .ok_or("Engine capture requires an acknowledged prefill key")?;
+            context.insert("prefill_key".into(), json!(key));
+        }
     }
     if enabled(request) {
         let start = prefill
