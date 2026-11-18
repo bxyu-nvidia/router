@@ -613,13 +613,15 @@ mod tests {
             assert_eq!(body["tools"][0]["type"], "function");
             assert_eq!(body["required_prefix_token_ids"], json!([4, 5]));
             assert!(body.get("ng_capture").is_none());
+            assert_eq!(body["nemo_rl_capture"]["weight_version"], 7);
+            assert_eq!(body["nemo_rl_capture"]["admission"]["model_call_id"], "c1");
             Json(json!({"choices": [{"message": {"content": "world"}}], "nemo_rl_pd_capture": {"prefill": "routes"}}))
         }));
         let (app, gate, mock, task) = capture_app(downstream, StatusCode::OK, 1).await;
         gate.pause().await.unwrap();
         gate.set_version(7).unwrap();
         gate.resume().unwrap();
-        let response = app.oneshot(captured_request(json!({}))).await.unwrap();
+        let response = app.oneshot(captured_request(json!({"nemo_rl_capture":{"weight_version":999,"admission":{"model_call_id":"forged"}}}))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[WEIGHT_VERSION_HEADER], "7");
         let body: serde_json::Value = serde_json::from_slice(

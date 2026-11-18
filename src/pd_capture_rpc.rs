@@ -192,6 +192,12 @@ impl CaptureClient {
             .get("ng_capture")
             .filter(|value| value.get() != "null")
         else {
+            if original.contains_key("nemo_rl_capture") {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "nemo_rl_capture is owned by managed capture admission",
+                );
+            }
             return next
                 .run(Request::from_parts(parts, Body::from(bytes)))
                 .await;
@@ -210,6 +216,10 @@ impl CaptureClient {
         let prepared = match self.rpc("prepare", bytes).await {
             Ok(body) => body,
             Err(error) => return error,
+        };
+        let prepared = match attach_engine_context(&prepared, &admission, weight_version) {
+            Ok(body) => body,
+            Err(_) => return failure(StatusCode::BAD_GATEWAY, "Invalid prepared capture context"),
         };
         parts.headers.remove(header::CONTENT_LENGTH);
         parts.extensions.insert(ManagedCapture);
@@ -269,6 +279,25 @@ impl CaptureClient {
         );
         Response::from_parts(parts, Body::from(completed))
     }
+}
+
+/// Add router-owned context while preserving large prepared fields as raw JSON.
+fn attach_engine_context(
+    prepared: &[u8],
+    admission: &RawValue,
+    weight_version: u64,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut fields: BTreeMap<String, &RawValue> = serde_json::from_slice(prepared)?;
+    let top_logprobs = fields.get("top_logprobs").map_or("0", |value| value.get());
+    let routed_experts = fields
+        .get("nemo_rl_pd_capture")
+        .map_or("false", |value| value.get());
+    let context = RawValue::from_string(format!(
+        "{{\"version\":1,\"admission\":{},\"weight_version\":{},\"phase\":\"decode\",\"top_logprobs\":{},\"routed_experts\":{}}}",
+        admission.get(), weight_version, top_logprobs, routed_experts,
+    ))?;
+    fields.insert("nemo_rl_capture".into(), &context);
+    serde_json::to_vec(&fields)
 }
 
 /// Inspect nested transport errors: reqwest's top-level kind can just be Request.
@@ -651,10 +680,20 @@ mod tests {
                     let prepared = prepared.clone();
                     async move {
                         assert!(request.extensions().get::<ManagedCapture>().is_some());
-                        assert_eq!(
-                            to_bytes(request.into_body(), MAX_BODY_BYTES).await.unwrap(),
-                            prepared
-                        );
+                        let body = to_bytes(request.into_body(), MAX_BODY_BYTES).await.unwrap();
+                        let mut fields: BTreeMap<String, &RawValue> =
+                            serde_json::from_slice(&body).unwrap();
+                        let context: serde_json::Value =
+                            serde_json::from_str(fields.remove("nemo_rl_capture").unwrap().get())
+                                .unwrap();
+                        assert_eq!(context["weight_version"], 7);
+                        assert_eq!(context["admission"]["model_call_id"], "raw");
+                        let original: BTreeMap<String, &RawValue> =
+                            serde_json::from_str(&prepared).unwrap();
+                        assert_eq!(fields.len(), original.len());
+                        for (key, value) in original {
+                            assert_eq!(fields[&key].get(), value.get());
+                        }
                         // Exercise chunked forwarding, including a split inside a JSON string.
                         let mut response =
                             Response::new(Body::from_stream(futures_util::stream::iter([
@@ -704,6 +743,48 @@ mod tests {
         );
         server.abort();
     }
+    #[tokio::test]
+    async fn client_context_cannot_bypass_managed_admission() {
+        use tower::ServiceExt;
+        let client = Arc::new(
+            CaptureClient::new(
+                "http://127.0.0.1:1".into(),
+                "test".into(),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let client = client.clone();
+                    async move { client.run(request, next, 7).await }
+                },
+            ));
+        for (body, status) in [
+            (r#"{"messages":[]}"#, StatusCode::OK),
+            (
+                r#"{"messages":[],"nemo_rl_capture":{"weight_version":999}}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+    }
+
     #[tokio::test]
     async fn completion_uploads_have_no_worker_count_concurrency_cap() {
         const CALLS: u32 = 64;

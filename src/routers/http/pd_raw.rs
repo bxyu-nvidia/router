@@ -95,6 +95,7 @@ impl PdRequest {
                 | "logprobs"
                 | "echo"
                 | "nemo_rl_pd_capture"
+                | "nemo_rl_capture"
                 | "routed_experts_prompt_start"
                 | "return_token_ids"
                 | "kv_transfer_params" => {
@@ -276,6 +277,31 @@ mod tests {
                 .len(),
             100_000
         );
+    }
+
+    #[test]
+    fn capture_context_survives_both_legs_without_changing_kv_or_prefix() {
+        let body = br#"{"required_prefix_token_ids":[1,2,3],"vllm_xargs":{"extension":42},"kv_transfer_params":{"remote_num_tokens":2},"nemo_rl_capture":{"version":1,"admission":{"model_call_id":"call","prev_len":3,"staging_chain":["parent"]},"weight_version":7,"phase":"decode","top_logprobs":8,"routed_experts":true}}"#;
+        let original = PdRequest::managed(body).unwrap();
+        for phase in ["prefill", "decode"] {
+            let mut request = original.clone();
+            if phase == "prefill" {
+                super::super::pd_capture::prepare_prefill(&mut request);
+            } else {
+                super::super::pd_capture::prepare_decode(&mut request, &Value::Null).unwrap();
+            }
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["nemo_rl_capture"]["phase"], phase);
+            assert_eq!(encoded["nemo_rl_capture"]["weight_version"], 7);
+            assert_eq!(
+                encoded["nemo_rl_capture"]["admission"]["staging_chain"],
+                json!(["parent"])
+            );
+            assert_eq!(encoded["required_prefix_token_ids"], json!([1, 2, 3]));
+            assert_eq!(encoded["vllm_xargs"]["extension"], 42);
+            assert_eq!(encoded["kv_transfer_params"]["remote_num_tokens"], 2);
+        }
+        assert_eq!(original["nemo_rl_capture"]["phase"], "decode");
     }
 
     #[test]

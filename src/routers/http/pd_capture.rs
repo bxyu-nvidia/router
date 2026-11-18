@@ -99,6 +99,12 @@ pub fn validate(request: &Value, path: &str, sequential_nixl: bool) -> Result<()
 }
 
 pub fn prepare_prefill(request: &mut Value) {
+    if let Some(context) = request
+        .get_mut("nemo_rl_capture")
+        .and_then(Value::as_object_mut)
+    {
+        context.insert("phase".into(), json!("prefill"));
+    }
     if enabled(request) {
         request["return_token_ids"] = json!(true);
     }
@@ -108,6 +114,12 @@ pub fn prepare_prefill(request: &mut Value) {
 }
 
 pub fn prepare_decode(request: &mut Value, prefill: &Value) -> Result<(), String> {
+    if let Some(context) = request
+        .get_mut("nemo_rl_capture")
+        .and_then(Value::as_object_mut)
+    {
+        context.insert("phase".into(), json!("decode"));
+    }
     if enabled(request) {
         let start = prefill
             .pointer("/nemo_rl_pd_capture/decode_route_start")
