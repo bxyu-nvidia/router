@@ -916,10 +916,12 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                let error_body = prefill_response.text().await.unwrap_or_default();
+                let error_body = prefill_response.text().await.unwrap_or_else(|error| {
+                    format!("<failed to read error body: {}>", error_chain(&error))
+                });
                 return Err(format!(
-                    "Prefill server error {}: {}",
-                    prefill_status, error_body
+                    "Prefill server {} returned HTTP {}: {}",
+                    prefill_request_url, prefill_status, error_body
                 ));
             }
 
@@ -1330,6 +1332,22 @@ impl VllmPDRouter {
             "📥 Prefill response headers: {:?}",
             prefill_response.headers()
         );
+
+        let prefill_status = prefill_response.status();
+        if !prefill_status.is_success() {
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            let error_body = prefill_response.text().await.unwrap_or_else(|error| {
+                format!("<failed to read error body: {}>", error_chain(&error))
+            });
+            return Err(PDRouterError::NetworkError {
+                message: format!(
+                    "Prefill server {} returned HTTP {}: {}",
+                    prefill_url, prefill_status, error_body
+                ),
+            });
+        }
 
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
@@ -3088,6 +3106,88 @@ mod tests {
             "the prefill load must have been released at the transition"
         );
     }
+    #[tokio::test]
+    async fn pd_prefill_http_error_preserves_cause_and_never_dispatches_decode() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        for discovered in [false, true] {
+            for (status, body) in [
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":{"message":"finalize_capture: storage unavailable"}}"#,
+                ),
+                (StatusCode::BAD_REQUEST, "capture request rejected"),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let decode_calls = Arc::new(AtomicUsize::new(0));
+                let calls = decode_calls.clone();
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    post(move |axum::Json(request): axum::Json<Value>| {
+                        let calls = calls.clone();
+                        async move {
+                            if request["nemo_rl_capture"]["phase"] == "decode" {
+                                calls.fetch_add(1, Ordering::Relaxed);
+                            }
+                            (status, body)
+                        }
+                    }),
+                );
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let router = test_vllm_pd_router();
+                let request =
+                    PdRequest::managed(br#"{"messages":[],"nemo_rl_capture":{"phase":"decode"}}"#)
+                        .unwrap();
+                let url = format!("http://{address}");
+                let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                    url.clone(),
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                let decode: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(url.clone(), WorkerType::Decode));
+                let error = if discovered {
+                    router
+                        .process_vllm_two_stage_request_discovered(
+                            request,
+                            &(address.to_string(), "p".into()),
+                            &(address.to_string(), "d".into()),
+                            "/v1/chat/completions",
+                            None,
+                        )
+                        .await
+                        .unwrap_err()
+                } else {
+                    router
+                        .process_vllm_two_stage_request(
+                            request,
+                            prefill.clone(),
+                            decode.clone(),
+                            "/v1/chat/completions",
+                            None,
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                };
+                server.abort();
+                assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+                assert!(error.contains(body), "prefill error was hidden: {error}");
+                assert!(
+                    error.contains(status.as_str()),
+                    "HTTP status was lost: {error}"
+                );
+                assert!(error.contains(&url), "prefill endpoint was lost: {error}");
+                assert!(!error.contains("acknowledged prefill key"));
+            }
+        }
+    }
+
     /// Exercise the real HTTP dispatch and response paths in both routing modes.
     #[tokio::test]
     async fn pd_chat_capture_http_forwards_engine_references_and_receipts() {
