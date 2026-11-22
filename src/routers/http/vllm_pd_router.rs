@@ -703,7 +703,7 @@ impl VllmPDRouter {
         }
 
         if managed {
-            return pd_raw::decode_response(decode_response);
+            return pd_raw::forward_response(decode_response);
         }
 
         if needs_logprobs && !is_streaming && decode_response.status().is_success() {
@@ -916,6 +916,11 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                // A rejected request never reached decode; preserve its status so
+                // managed admission does not mistake it for an uncertain drain.
+                if prefill_status.is_client_error() {
+                    return pd_raw::forward_response(prefill_response);
+                }
                 let error_body = prefill_response.text().await.unwrap_or_else(|error| {
                     format!("<failed to read error body: {}>", error_chain(&error))
                 });
@@ -1338,6 +1343,11 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
             RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            // No decode was dispatched for a rejected prefill request.
+            if prefill_status.is_client_error() {
+                return pd_raw::forward_response(prefill_response)
+                    .map_err(|message| PDRouterError::NetworkError { message });
+            }
             let error_body = prefill_response.text().await.unwrap_or_else(|error| {
                 format!("<failed to read error body: {}>", error_chain(&error))
             });
@@ -1560,7 +1570,7 @@ impl VllmPDRouter {
             .unwrap_or(false);
 
         if original_request.managed {
-            return pd_raw::decode_response(decode_response)
+            return pd_raw::forward_response(decode_response)
                 .map_err(|message| PDRouterError::NetworkError { message });
         }
 
@@ -3117,7 +3127,7 @@ mod tests {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     r#"{"error":{"message":"finalize_capture: storage unavailable"}}"#,
                 ),
-                (StatusCode::BAD_REQUEST, "capture request rejected"),
+                (StatusCode::BAD_GATEWAY, "prefill upstream failed"),
             ] {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
@@ -3184,6 +3194,191 @@ mod tests {
                 );
                 assert!(error.contains(&url), "prefill endpoint was lost: {error}");
                 assert!(!error.contains("acknowledged prefill key"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_rejection_preserves_status_and_admission_health() {
+        use crate::pd_admission::{self, PDAdmission};
+        use axum::{http::Request as HttpRequest, middleware::from_fn_with_state, routing::post};
+        use tokio::net::TcpListener;
+        use tower::ServiceExt;
+
+        const ERROR_BODY: &str = r#"{"error":{"message":"Input is too long: 264101 tokens exceeds 262144","type":"BadRequestError"}}"#;
+
+        for discovered in [false, true] {
+            for (managed, streaming) in [(false, false), (false, true), (true, false)] {
+                for status in [
+                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ] {
+                    let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let prefill_address = prefill_listener.local_addr().unwrap();
+                    let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let decode_address = decode_listener.local_addr().unwrap();
+                    let decode_calls = Arc::new(AtomicUsize::new(0));
+                    let calls = decode_calls.clone();
+                    let prefill_app = axum::Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| async move {
+                            if body["messages"][0]["content"] == "reject" {
+                                (status, [("content-type", "application/json"), ("retry-after", "7")], ERROR_BODY).into_response()
+                            } else {
+                                Json(json!({"kv_transfer_params":{"remote_num_tokens":2,"nemo_rl_prefill_key":"stored-prefill"},"choices":[]})).into_response()
+                            }
+                        }));
+                    let decode_app = axum::Router::new().route(
+                        "/v1/chat/completions",
+                        post(move || {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            async { Json(json!({"choices":[{"message":{"content":"ok"}}]})) }
+                        }),
+                    );
+                    let prefill_server = tokio::spawn(async move {
+                        axum::serve(prefill_listener, prefill_app).await.unwrap()
+                    });
+                    let decode_server = tokio::spawn(async move {
+                        axum::serve(decode_listener, decode_app).await.unwrap()
+                    });
+                    let mut router = test_vllm_pd_router();
+                    router.use_discovery = discovered;
+                    let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                        format!("http://{prefill_address}"),
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                    ));
+                    let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                        format!("http://{decode_address}"),
+                        WorkerType::Decode,
+                    ));
+                    router.worker_registry().register(prefill.clone());
+                    router.worker_registry().register(decode.clone());
+                    router.service_registry.register_service(
+                        prefill_address.to_string(),
+                        "p".into(),
+                        ServiceType::Prefill,
+                    );
+                    router.service_registry.register_service(
+                        decode_address.to_string(),
+                        "d".into(),
+                        ServiceType::Decode,
+                    );
+                    let router = Arc::new(router);
+                    let gate = PDAdmission::new("control-secret".into()).unwrap();
+                    let app = axum::Router::new()
+                        .route(
+                            "/v1/chat/completions",
+                            post(move |Json(body): Json<Value>| {
+                                let router = router.clone();
+                                async move {
+                                    if managed {
+                                        router
+                                            .route_managed_chat(
+                                                None,
+                                                serde_json::to_vec(&body).unwrap().into(),
+                                            )
+                                            .await
+                                    } else {
+                                        router
+                                            .route_transparent(
+                                                None,
+                                                "/v1/chat/completions",
+                                                &Method::POST,
+                                                body,
+                                            )
+                                            .await
+                                    }
+                                }
+                            }),
+                        )
+                        .merge(pd_admission::routes(Some(gate.clone())))
+                        .layer(from_fn_with_state(Some(gate), pd_admission::middleware));
+                    let request = |content: &str, stream: bool| {
+                        let mut body = json!({"model":"test","messages":[{"role":"user","content":content}],"max_tokens":8,"stream":stream});
+                        if managed {
+                            body["nemo_rl_capture"] = json!({"phase":"decode"});
+                        }
+                        HttpRequest::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap()
+                    };
+                    let response = app
+                        .clone()
+                        .oneshot(request("reject", streaming))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), status);
+                    if status.is_client_error() {
+                        assert_eq!(response.headers()["content-type"], "application/json");
+                        assert_eq!(response.headers()["retry-after"], "7");
+                    }
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    if status.is_client_error() {
+                        assert_eq!(bytes.as_ref(), ERROR_BODY.as_bytes());
+                    } else {
+                        assert!(std::str::from_utf8(&bytes).unwrap().contains(ERROR_BODY));
+                    }
+                    assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
+                    assert_eq!(prefill.load(), 0);
+                    assert_eq!(decode.load(), 0);
+
+                    let response = app.clone().oneshot(request("ok", false)).await.unwrap();
+                    assert_eq!(
+                        response.status(),
+                        if status.is_client_error() {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    );
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    if status.is_client_error() {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&bytes).unwrap()["choices"][0]
+                                ["message"]["content"],
+                            "ok"
+                        );
+                    }
+                    assert_eq!(
+                        decode_calls.load(Ordering::Relaxed),
+                        usize::from(status.is_client_error())
+                    );
+                    let state_response = app
+                        .oneshot(
+                            HttpRequest::builder()
+                                .method("POST")
+                                .uri("/nemo_rl/admission")
+                                .header("authorization", "Bearer control-secret")
+                                .header("content-type", "application/json")
+                                .body(Body::from(r#"{"operation":"status"}"#))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(state_response.status(), StatusCode::OK);
+                    let state: Value = serde_json::from_slice(
+                        &axum::body::to_bytes(state_response.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(state["state"]["active"], 0);
+                    assert_eq!(
+                        state["state"]["failure"].is_null(),
+                        status.is_client_error()
+                    );
+                    prefill_server.abort();
+                    decode_server.abort();
+                }
             }
         }
     }

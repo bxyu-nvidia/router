@@ -135,8 +135,8 @@ impl PdRequest {
     }
 }
 
-/// Forward the engine response, including its acknowledged commit receipt.
-pub(crate) fn decode_response(response: reqwest::Response) -> Result<Response, String> {
+/// Forward an engine response, including errors and acknowledged commit receipts.
+pub(crate) fn forward_response(response: reqwest::Response) -> Result<Response, String> {
     let mut builder = Response::builder().status(response.status());
     for (name, value) in response.headers() {
         if name != "content-length" && name != "transfer-encoding" && name != "content-encoding" {
