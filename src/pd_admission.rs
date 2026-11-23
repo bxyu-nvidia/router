@@ -33,6 +33,9 @@ struct AdmissionState {
     active: usize,
     weight_version: u64,
     failure: Option<String>,
+    // A publication is valid only for the current admission-closure window.
+    #[serde(skip)]
+    suspended_version: Option<u64>,
 }
 
 pub struct PDAdmission {
@@ -55,6 +58,7 @@ impl PDAdmission {
                 active: 0,
                 weight_version: 0,
                 failure: None,
+                suspended_version: None,
             }),
             changed: Notify::new(),
         }))
@@ -90,6 +94,9 @@ impl PDAdmission {
             let mut state = self.state.lock();
             if let Some(failure) = &state.failure {
                 return Err(failure.clone());
+            }
+            if !state.paused {
+                state.suspended_version = None;
             }
             state.paused = true;
             state.active
@@ -153,6 +160,41 @@ impl PDAdmission {
         Ok(())
     }
 
+    // The authenticated controller calls this only after both pools finish
+    // loading weights while suspended. Existing Admission objects deliberately
+    // retain their original version, including calls still crossing P -> D.
+    fn publish_suspended_version(&self, version: u64) -> Result<(), String> {
+        let mut state = self.state.lock();
+        if state.failure.is_some() || !state.paused {
+            return Err("Close admission and suspend engines before publishing a version".into());
+        }
+        if version < state.weight_version {
+            return Err("Policy weight version must not decrease".into());
+        }
+        if state
+            .suspended_version
+            .is_some_and(|published| published != version)
+        {
+            return Err("This suspended refit already published a different version".into());
+        }
+        state.weight_version = version;
+        state.suspended_version = Some(version);
+        Ok(())
+    }
+
+    fn resume_suspended(&self, version: u64) -> Result<(), String> {
+        let mut state = self.state.lock();
+        if state.failure.is_some()
+            || state.suspended_version != Some(version)
+            || state.weight_version != version
+        {
+            return Err("Cannot resume suspended admission without its published version".into());
+        }
+        state.paused = false;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     fn fail(&self, message: &str) {
         let mut state = self.state.lock();
         state.paused = true;
@@ -193,6 +235,12 @@ pub enum ControlRequest {
         weight_version: u64,
     },
     Resume,
+    PublishSuspendedVersion {
+        weight_version: u64,
+    },
+    ResumeSuspended {
+        weight_version: u64,
+    },
 }
 
 pub fn routes<S: Clone + Send + Sync + 'static>(gate: Option<Arc<PDAdmission>>) -> Router<S> {
@@ -235,9 +283,13 @@ async fn control(
         ControlRequest::Pause => gate.pause().await,
         ControlRequest::SetVersion { weight_version } => gate.set_version(weight_version),
         ControlRequest::Resume => gate.resume(),
+        ControlRequest::PublishSuspendedVersion { weight_version } => {
+            gate.publish_suspended_version(weight_version)
+        }
+        ControlRequest::ResumeSuspended { weight_version } => gate.resume_suspended(weight_version),
     };
     match result {
-        Ok(()) => Json(json!({"ok": true, "version": 1, "admission_protocol": 2, "capture_protocol": gate.engine_capture.lock().as_ref().map(|_| 2), "state": gate.state.lock().clone()}))
+        Ok(()) => Json(json!({"ok": true, "version": 1, "admission_protocol": 2, "suspended_refit_protocol": 1, "capture_protocol": gate.engine_capture.lock().as_ref().map(|_| 2), "state": gate.state.lock().clone()}))
             .into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
     }
@@ -462,6 +514,110 @@ mod tests {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspended_publication_preserves_live_call_versions_across_refits() {
+        let gate = gate();
+        let entered = Arc::new(Semaphore::new(0));
+        let finish = Arc::new(Semaphore::new(0));
+        let downstream = {
+            let entered = entered.clone();
+            let finish = finish.clone();
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let entered = entered.clone();
+                    let finish = finish.clone();
+                    async move {
+                        entered.add_permits(1);
+                        finish.acquire().await.unwrap().forget();
+                        "complete"
+                    }
+                }),
+            )
+        };
+        let app = app(Some(gate.clone()), downstream);
+        let old_call = tokio::spawn(app.clone().oneshot(request()));
+        entered.acquire().await.unwrap().forget();
+        for version in [1, 2] {
+            assert_eq!(
+                command(&app, json!({"operation":"close"})).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(gate.state.lock().active, 1);
+            // Neither an old acknowledgment nor a premature resume opens the gate.
+            assert_eq!(
+                command(
+                    &app,
+                    json!({"operation":"resume_suspended", "weight_version":version - 1})
+                )
+                .await
+                .status(),
+                StatusCode::CONFLICT
+            );
+            for _ in 0..2 {
+                let published = command(
+                    &app,
+                    json!({"operation":"publish_suspended_version", "weight_version":version}),
+                )
+                .await;
+                assert_eq!(published.status(), StatusCode::OK);
+                let value: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(published.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(value["suspended_refit_protocol"], 1);
+                assert_eq!(value["state"]["paused"], true);
+            }
+            let waiting = gate.admit();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(
+                command(
+                    &app,
+                    json!({"operation":"resume_suspended", "weight_version":version + 1})
+                )
+                .await
+                .status(),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                command(
+                    &app,
+                    json!({"operation":"resume_suspended", "weight_version":version})
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+            let mut admitted = waiting.await.unwrap();
+            assert_eq!(admitted.weight_version, version);
+            admitted.complete = true;
+        }
+        finish.add_permits(1);
+        let response = old_call.await.unwrap().unwrap();
+        assert_eq!(response.headers()[WEIGHT_VERSION_HEADER], "0");
+        consume(response).await;
+    }
+
+    #[tokio::test]
+    async fn suspended_publication_rejects_conflicts_and_failed_admission() {
+        let gate = gate();
+        let mut active = gate.admit().await.unwrap();
+        assert!(gate.publish_suspended_version(1).is_err());
+        gate.close().unwrap();
+        gate.publish_suspended_version(1).unwrap();
+        assert!(gate.publish_suspended_version(0).is_err());
+        assert!(gate.publish_suspended_version(2).is_err());
+        assert!(gate.state.lock().paused);
+        gate.fail("engine failed while refitting");
+        assert!(gate.publish_suspended_version(1).is_err());
+        assert!(gate.resume_suspended(1).is_err());
+        assert!(gate.state.lock().paused);
+        active.complete = true;
     }
 
     #[tokio::test]
