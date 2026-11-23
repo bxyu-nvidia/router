@@ -516,6 +516,59 @@ mod tests {
             .unwrap();
     }
 
+    // Bounded owner counts catch retained admissions without relying on the
+    // allocator returning pages to the OS. Network/engine memory is measured
+    // by NeMo RL's opt-in frontend/capture stress harness instead.
+    #[tokio::test]
+    async fn suspended_refits_recycle_2048_admissions_without_losing_versions() {
+        const CONCURRENCY: usize = 2048;
+        let gate = gate();
+        let mut active = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            active.push(gate.admit().await.unwrap());
+        }
+        for version in 1..=16 {
+            gate.close().unwrap();
+            let prior_versions: Vec<_> = active.iter().map(|call| call.weight_version).collect();
+            gate.publish_suspended_version(version).unwrap();
+            assert_eq!(
+                active
+                    .iter()
+                    .map(|call| call.weight_version)
+                    .collect::<Vec<_>>(),
+                prior_versions
+            );
+            assert_eq!(gate.state.lock().active, CONCURRENCY);
+
+            // Finish half while closed; replacements must remain parked until
+            // the controller has resumed the engines and opens admission.
+            for mut call in active.drain(..CONCURRENCY / 2) {
+                call.complete = true;
+            }
+            let replacements = future::join_all((0..CONCURRENCY / 2).map(|_| gate.admit()));
+            tokio::pin!(replacements);
+            assert!(futures::poll!(&mut replacements).is_pending());
+            assert_eq!(gate.state.lock().active, CONCURRENCY / 2);
+            assert!(gate.resume_suspended(version - 1).is_err());
+            gate.resume_suspended(version).unwrap();
+            for replacement in replacements.await {
+                let replacement = replacement.unwrap();
+                assert_eq!(replacement.weight_version, version);
+                active.push(replacement);
+            }
+            assert_eq!(gate.state.lock().active, CONCURRENCY);
+            assert_eq!(Arc::strong_count(&gate), CONCURRENCY + 1);
+        }
+        for mut call in active {
+            call.complete = true;
+        }
+        gate.close().unwrap();
+        gate.drain().await.unwrap();
+        assert_eq!(gate.state.lock().active, 0);
+        assert_eq!(Arc::strong_count(&gate), 1);
+        assert!(gate.state.lock().failure.is_none());
+    }
+
     #[tokio::test]
     async fn suspended_publication_preserves_live_call_versions_across_refits() {
         let gate = gate();
