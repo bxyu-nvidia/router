@@ -83,18 +83,24 @@ impl PDAdmission {
         }
     }
 
-    async fn pause(&self) -> Result<(), String> {
-        let started = std::time::Instant::now();
+    // Closing gates new requests only. Existing admissions retain their
+    // version and ownership through prefill, handoff, and response EOF.
+    fn close(&self) -> Result<(), String> {
         let active = {
             let mut state = self.state.lock();
+            if let Some(failure) = &state.failure {
+                return Err(failure.clone());
+            }
             state.paused = true;
             state.active
         };
-        tracing::info!(
-            active,
-            "[pd-refit] admission closed; waiting for requests to drain"
-        );
+        tracing::info!(active, "[pd-refit] admission closed");
         self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn drain(&self) -> Result<(), String> {
+        let started = std::time::Instant::now();
         loop {
             let wake = self.changed.notified();
             tokio::pin!(wake);
@@ -103,6 +109,9 @@ impl PDAdmission {
                 let state = self.state.lock();
                 if let Some(failure) = &state.failure {
                     return Err(failure.clone());
+                }
+                if !state.paused {
+                    return Err("Close admission before waiting for requests to drain".into());
                 }
                 if state.active == 0 {
                     tracing::info!(
@@ -114,6 +123,12 @@ impl PDAdmission {
             }
             wake.await;
         }
+    }
+
+    // Preserve the original close-and-drain operation for existing clients.
+    async fn pause(&self) -> Result<(), String> {
+        self.close()?;
+        self.drain().await
     }
 
     fn set_version(&self, version: u64) -> Result<(), String> {
@@ -171,6 +186,8 @@ pub enum ControlRequest {
         top_logprobs: u32,
         routed_experts: bool,
     },
+    Close,
+    Drain,
     Pause,
     SetVersion {
         weight_version: u64,
@@ -213,12 +230,14 @@ async fn control(
                 Ok(())
             }
         }
+        ControlRequest::Close => gate.close(),
+        ControlRequest::Drain => gate.drain().await,
         ControlRequest::Pause => gate.pause().await,
         ControlRequest::SetVersion { weight_version } => gate.set_version(weight_version),
         ControlRequest::Resume => gate.resume(),
     };
     match result {
-        Ok(()) => Json(json!({"ok": true, "version": 1, "capture_protocol": gate.engine_capture.lock().as_ref().map(|_| 2), "state": gate.state.lock().clone()}))
+        Ok(()) => Json(json!({"ok": true, "version": 1, "admission_protocol": 2, "capture_protocol": gate.engine_capture.lock().as_ref().map(|_| 2), "state": gate.state.lock().clone()}))
             .into_response(),
         Err(error) => (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
     }
@@ -540,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_version_changes_only_after_both_phases_drain() {
+    async fn close_preserves_running_calls_and_blocks_new_requests_until_drain() {
         let gate = gate();
         let entered = Arc::new(Semaphore::new(0));
         let prefill_done = Arc::new(Semaphore::new(0));
@@ -577,7 +596,29 @@ mod tests {
         );
         let running = tokio::spawn(app.clone().oneshot(request()));
         entered.acquire().await.unwrap().forget();
-        let pause = command(&app, json!({"operation": "pause"}));
+        // Closure acknowledges immediately, before either upstream phase has
+        // finished. Repeating it must not reset the active request's version.
+        for _ in 0..2 {
+            let close = command(&app, json!({"operation": "close"}));
+            tokio::pin!(close);
+            let std::task::Poll::Ready(response) = futures::poll!(&mut close) else {
+                panic!("closing admission waited for an active request");
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["admission_protocol"], 2);
+            assert_eq!(body["state"]["active"], 1);
+            assert_eq!(body["state"]["paused"], true);
+            assert_eq!(body["state"]["weight_version"], 0);
+        }
+        assert_eq!(
+            command(&app, json!({"operation": "resume"})).await.status(),
+            StatusCode::CONFLICT
+        );
+        let pause = command(&app, json!({"operation": "drain"}));
         tokio::pin!(pause);
         assert!(futures::poll!(&mut pause).is_pending());
         assert!(gate.state.lock().paused);
@@ -803,30 +844,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_requires_closed_admission_and_is_repeatable() {
+        let gate = gate();
+        let app = app(Some(gate.clone()), Router::new());
+        assert_eq!(
+            command(&app, json!({"operation": "drain"})).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert!(!gate.state.lock().paused);
+        assert_eq!(
+            command(&app, json!({"operation": "close"})).await.status(),
+            StatusCode::OK
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                command(&app, json!({"operation": "drain"})).await.status(),
+                StatusCode::OK
+            );
+        }
+        gate.resume().unwrap();
+        assert!(gate.drain().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_drain_does_not_reopen_admission_or_cancel_active_calls() {
+        let gate = gate();
+        let mut admitted = gate.admit().await.unwrap();
+        gate.close().unwrap();
+        {
+            let drain = gate.drain();
+            tokio::pin!(drain);
+            assert!(futures::poll!(&mut drain).is_pending());
+        }
+        assert!(gate.state.lock().paused);
+        assert_eq!(gate.state.lock().active, 1);
+        assert!(gate.state.lock().failure.is_none());
+        assert!(gate.resume().is_err());
+        assert!(gate.set_version(1).is_err());
+        admitted.complete = true;
+        drop(admitted);
+        gate.drain().await.unwrap();
+        gate.set_version(1).unwrap();
+        gate.resume().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_after_close_wakes_drain_and_queued_requests() {
+        let gate = gate();
+        let mut admitted = gate.admit().await.unwrap();
+        let app = app(Some(gate.clone()), Router::new());
+        gate.close().unwrap();
+        let drain = command(&app, json!({"operation": "drain"}));
+        let waiting = app.clone().oneshot(request());
+        tokio::pin!(drain, waiting);
+        assert!(futures::poll!(&mut drain).is_pending());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        gate.fail("engine died during drain");
+        assert_eq!(drain.await.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            waiting.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        for operation in ["close", "resume", "pause"] {
+            assert_eq!(
+                command(&app, json!({"operation": operation}))
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        admitted.complete = true;
+        drop(admitted);
+        assert!(gate.drain().await.is_err());
+        assert!(gate.set_version(1).is_err());
+    }
+
+    #[tokio::test]
     async fn control_requires_authentication_and_is_opt_in() {
         let gate = gate();
         let app = app(Some(gate.clone()), Router::new());
-        let response = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri("/nemo_rl/admission")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"operation":"pause"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(!gate.state.lock().paused);
         let disabled = super::routes::<()>(None);
-        assert_eq!(
-            command(&disabled, json!({"operation": "pause"}))
+        for operation in ["close", "drain", "pause"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/nemo_rl/admission")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"operation": operation}).to_string()))
+                        .unwrap(),
+                )
                 .await
-                .status(),
-            StatusCode::NOT_FOUND
-        );
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(!gate.state.lock().paused);
+            assert_eq!(
+                command(&disabled, json!({"operation": operation}))
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 
     fn captured_request(extra: serde_json::Value) -> Request {
