@@ -84,7 +84,16 @@ impl PDAdmission {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.state.lock().paused = true;
+        let started = std::time::Instant::now();
+        let active = {
+            let mut state = self.state.lock();
+            state.paused = true;
+            state.active
+        };
+        tracing::info!(
+            active,
+            "[pd-refit] admission closed; waiting for requests to drain"
+        );
         self.changed.notify_waiters();
         loop {
             let wake = self.changed.notified();
@@ -96,6 +105,10 @@ impl PDAdmission {
                     return Err(failure.clone());
                 }
                 if state.active == 0 {
+                    tracing::info!(
+                        elapsed_s = started.elapsed().as_secs_f64(),
+                        "[pd-refit] router drain completed"
+                    );
                     return Ok(());
                 }
             }
@@ -605,6 +618,82 @@ mod tests {
         let response = waiting.await.unwrap();
         assert_eq!(response.headers()[WEIGHT_VERSION_HEADER], "7");
         consume(response).await;
+    }
+
+    // CPU reproduction of the refit gap: three HTTP calls are parked in
+    // prefill, handoff, and decode. Execution/transport are gated test doubles;
+    // admission, response ownership, version checks, and pause are production.
+    #[tokio::test]
+    async fn refit_drain_waits_for_long_decode_after_prefill_and_handoff_settle() {
+        let gate = gate();
+        let stages: Arc<Vec<Vec<Semaphore>>> = Arc::new(
+            (0..3)
+                .map(|_| (0..3).map(|_| Semaphore::new(0)).collect())
+                .collect(),
+        );
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let downstream = {
+            let stages = stages.clone();
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(id): Json<usize>| {
+                    let stages = stages.clone();
+                    let entered_tx = entered_tx.clone();
+                    async move {
+                        for phase in id..3 {
+                            entered_tx.send((id, phase)).unwrap();
+                            stages[id][phase].acquire().await.unwrap().forget();
+                        }
+                        "complete"
+                    }
+                }),
+            )
+        };
+        let app = app(Some(gate.clone()), downstream);
+        let mut running = Vec::new();
+        for id in 0..3 {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(id.to_string()))
+                .unwrap();
+            running.push(tokio::spawn(app.clone().oneshot(request)));
+        }
+        let mut initial = Vec::new();
+        for _ in 0..3 {
+            initial.push(entered_rx.recv().await.unwrap());
+        }
+        initial.sort();
+        assert_eq!(initial, vec![(0, 0), (1, 1), (2, 2)]);
+        let pause = command(&app, json!({"operation": "pause"}));
+        tokio::pin!(pause);
+        assert!(futures::poll!(&mut pause).is_pending());
+        assert!(gate.state.lock().paused);
+        assert_eq!(gate.state.lock().active, 3);
+
+        stages[0][0].add_permits(1);
+        assert_eq!(entered_rx.recv().await.unwrap(), (0, 1));
+        assert!(futures::poll!(&mut pause).is_pending());
+        for id in 0..2 {
+            stages[id][1].add_permits(1);
+            assert_eq!(entered_rx.recv().await.unwrap(), (id, 2));
+        }
+        // Even with every P->D handoff settled, refit still waits for EOF.
+        assert!(futures::poll!(&mut pause).is_pending());
+        for (id, task) in running.into_iter().enumerate() {
+            assert!(futures::poll!(&mut pause).is_pending());
+            assert_eq!(gate.state.lock().active, 3 - id);
+            assert!(gate.set_version(1).is_err());
+            stages[id][2].add_permits(1);
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.headers()[WEIGHT_VERSION_HEADER], "0");
+            consume(response).await;
+        }
+        assert_eq!(pause.await.status(), StatusCode::OK);
+        assert_eq!(gate.state.lock().active, 0);
+        gate.set_version(1).unwrap();
+        gate.resume().unwrap();
     }
 
     #[tokio::test]
